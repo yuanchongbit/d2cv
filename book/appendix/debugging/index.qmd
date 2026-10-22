@@ -5,16 +5,355 @@ title: "附录 F：常见错误与调试手册"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
+- 用途：出错时按症状查表，不要从头重跑
 :::
 
-## 内容规划
+调试的第一原则是**缩小搜索空间**：先确认错误发生在数据、模型、损失、评测还是部署，再用最小实验隔离变量。第二原则是**一次只改一个地方**，并记录改动前后的结果。最糟糕的调试方式，是同时改学习率、模型结构和数据增强，然后看到指标变好，却不知道原因。
 
-- 形状、设备、数据类型错误
-- 显存、数值不稳定与训练不收敛
-- 数据泄漏、指标误读与前后处理不一致
+本附录按症状组织。每个问题给出最可能的原因、第一条检查命令和修复方向。它不能覆盖所有报错，但能帮你避免最常见的陷阱。
 
-## 说明
+## F.1 快速分诊表
 
-本附录将随正文同步完善，优先保证与章节代码、术语和评测口径一致。
+| 症状 | 最可能的原因 | 第一条检查 |
+|---|---|---|
+| 形状不匹配 | 维度顺序、广播、标签形状 | 前向传播每层打印 shape |
+| 设备不匹配 | 模型/数据/损失不在同一 device | 打印 `x.device`、`model` 参数 device |
+| dtype 不匹配 | 标签是 float、输入是 uint8 | 打印 `x.dtype`、`y.dtype` |
+| loss 为 NaN | 学习率过大、log(0)、除零、坏数据 | 检查输入范围、逐步缩小 LR |
+| loss 不降 | 标签错、参数冻结、优化器没接管参数 | 单 batch 过拟合 |
+| 训练好、验证差 | 过拟合、数据泄漏、分布不同 | 比较训练/验证预处理 |
+| 验证好、测试差 | 测试集调参、划分泄漏 | 检查选择过程和分组划分 |
+| 评测结果异常高 | 标签泄漏、重复样本、指标实现错 | 打乱标签做对照 |
+| 部署后精度掉 | 前后处理不一致、量化误差 | 对比同一输入的中间张量 |
+| 显存爆炸 | batch 太大、保留计算图、缓存未释放 | `torch.cuda.memory_summary()` |
+| 训练不可复现 | 种子、DataLoader、非确定性算子 | 固定种子和 worker 初始化 |
+| 多卡结果变差 | 学习率未缩放、BN 统计、数据重复 | 先单卡复现，再查分布式 |
+
+## F.2 形状、设备与 dtype
+
+### 形状错误
+
+PyTorch 的形状错误通常出现在矩阵乘法、广播、拼接和损失函数。排查顺序：
+
+1. 在 `forward` 开头打印输入 `x.shape`；
+2. 每经过一个模块打印一次 shape；
+3. 检查 batch 维是否被误当成特征维；
+4. 检查 `view`/`reshape` 前后的元素总数是否一致；
+5. 检查标签形状：分类标签通常是 `(B,)`，分割标签是 `(B,H,W)`，检测标签是变长列表。
+
+一个最小的形状检查函数：
+
+```python
+def check(name, x, expected=None):
+    print(name, tuple(x.shape), x.dtype, x.device)
+    if expected is not None:
+        assert tuple(x.shape) == expected, (name, x.shape, expected)
+```
+
+### 通道顺序
+
+本书图像张量使用 `(B,C,H,W)`，PIL/NumPy 图像通常是 `(H,W,C)`。把 PIL 图像直接 `torch.tensor(image)` 会得到 `(H,W,C)`，再送进卷积就会把高度当通道。使用 `ToTensor()` 或显式 `permute(2,0,1)`。
+
+OpenCV 默认 BGR，PIL 默认 RGB，Matplotlib 默认 RGB。混用会让红蓝通道互换，指标可能只掉几个点，肉眼却不易察觉。统一在数据加载层转换，并写一个测试：读一张已知颜色的图，打印通道均值。
+
+### 设备不匹配
+
+典型报错：
+
+```text
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!
+```
+
+检查：
+
+```python
+print(next(model.parameters()).device)
+print(x.device, y.device)
+```
+
+常见原因：模型 `.to(device)` 了但数据没有；损失函数内部的 buffer 在 CPU；自己创建的 mask/位置编码没有跟随输入；保存/加载后设备变化。不要在每个 batch 里反复 `.to(device)`，应在数据加载或训练循环入口统一移动。
+
+### dtype 不匹配
+
+- `CrossEntropyLoss` 的目标是 `long`，不是 `float`；
+- `BCEWithLogitsLoss` 的目标通常是同形状的 `float`；
+- 嵌入层的索引必须是 `long`；
+- 半精度训练时，损失缩放和 softmax 可能需要 FP32；
+- NumPy 默认 `float64`，转成 torch 后可能与 `float32` 模型冲突。
+
+统一在 collate 或训练循环中转换：
+
+```python
+x = x.float()
+y = y.long()
+```
+
+但不要无脑转换掩码和索引；先理解每个张量的语义。
+
+### `view` 与 `reshape`
+
+`view` 要求内存连续，`reshape` 在必要时会复制。转置或 `permute` 之后直接 `view` 常报：
+
+```text
+RuntimeError: view size is not compatible with input tensor's size and stride
+```
+
+解决：先 `.contiguous()` 再 `view`，或者直接用 `reshape`。如果性能敏感，尽量在 `permute` 后保持连续布局。
+
+## F.3 NaN、Inf 与梯度爆炸
+
+### 常见来源
+
+- 学习率过大，一步更新把参数推到极端；
+- `log(0)`、`sqrt(0)`、除以 0；
+- softmax/exp 上溢；
+- 混合精度下梯度下溢或损失缩放不当；
+- 输入包含 NaN/Inf（坏图像、坏标注、坏点云）；
+- 自定义损失中的 mask 全为 0，导致除以 0；
+- 对抗训练/生成模型中的不稳定项。
+
+### 排查步骤
+
+1. 检查输入：`torch.isfinite(x).all()`，定位到具体样本；
+2. 检查损失：打印每个损失项，确认是哪一项先变 NaN；
+3. 把学习率降低 10 倍，看是否消失；
+4. 开启异常检测：
+
+```python
+torch.autograd.set_detect_anomaly(True)
+```
+
+它会让反向传播变慢，但能定位到产生 NaN 的算子；
+
+5. 打印梯度范数：
+
+```python
+total_norm = torch.sqrt(sum(
+    p.grad.detach().norm() ** 2 for p in model.parameters() if p.grad is not None
+))
+print("grad norm:", total_norm.item())
+```
+
+6. 加入梯度裁剪：
+
+```python
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+```
+
+7. 对 `log`、`sqrt`、除法加 epsilon，并检查 mask 的分母。
+
+不要用 `torch.nan_to_num` 把 NaN 静默变成 0；它会让错误消失，但模型可能已经学坏。先找到来源，再决定是否容错。
+
+## F.4 Loss 不下降
+
+### 先做“单 batch 过拟合”
+
+这是最有效的排查实验：取一个固定 batch，关闭增强，训练 100–500 步，看 loss 能否降到接近 0、预测能否完全拟合。如果单 batch 都过拟合不了，问题在模型/标签/损失，而不是数据量或正则化。
+
+```python
+model.train()
+x, y = next(iter(train_loader))
+x, y = x.to(device), y.to(device)
+for step in range(200):
+    optimizer.zero_grad()
+    loss = criterion(model(x), y)
+    loss.backward()
+    optimizer.step()
+    if step % 20 == 0:
+        print(step, loss.item())
+```
+
+若 loss 不降，依次检查：
+
+1. 标签是否与输入对齐（打乱标签，loss 应该变差）；
+2. 参数是否 `requires_grad=True`；
+3. 优化器是否接收了正确的参数组；
+4. 是否误用了 `model.eval()` 或 `torch.no_grad()`；
+5. 学习率是否过小/过大；
+6. 损失函数输入是否是 logits（不要再手动 sigmoid）；
+7. 数据是否全为 0 或常数。
+
+### 训练 loss 降、验证 loss 升
+
+这是过拟合的典型信号，但也可能是验证集预处理不同。先比较：
+
+- 训练和验证的 resize、归一化、色彩空间是否一致；
+- 验证时是否忘记 `model.eval()`；
+- BatchNorm 是否在验证时使用了 batch 统计量；
+- 数据增强是否过强，导致训练分布与验证分布差距过大。
+
+如果确认是过拟合，再考虑权重衰减、dropout、早停、更多数据或更强增强。不要一上来就加正则化，先把评估流程对齐。
+
+### 指标不动的几种“假故障”
+
+- 学习率被 scheduler 降到 0；
+- 梯度累积时忘记 `optimizer.step()`；
+- 混合精度下 loss scale 变为 0；
+- 指标计算使用了 `torch.no_grad()` 之外的缓存；
+- 验证集只有一类，或标签映射错误；
+- 早停逻辑把“越小越好”的指标当成“越大越好”。
+
+## F.5 显存不足
+
+### 估算
+
+显存主要花在：
+
+- 模型参数；
+- 梯度；
+- 优化器状态（Adam 通常是参数的 2 倍）；
+- 激活值（与 batch、分辨率、层数成正比）；
+- 临时 workspace 和 CUDA 上下文。
+
+一个粗略的起点：混合精度下，训练显存约为参数的 4–6 倍加上激活；Adam + FP32 可能到 8–12 倍。实际值用 `torch.cuda.memory_summary()` 看。
+
+### 处理顺序
+
+1. 减小 batch size；
+2. 开启 AMP；
+3. 梯度累积（保持等效 batch）；
+4. 降低输入分辨率或裁剪；
+5. 冻结部分骨干；
+6. 梯度检查点；
+7. 清理不必要的中间变量和缓存；
+8. 使用更省显存的优化器（如 8-bit Adam）；
+9. 换卡或分布式。
+
+常见错误是 `loss` 或预测被列表保存，导致整个计算图无法释放。训练循环中只保留标量日志，不要保留带梯度的张量。
+
+### 显存泄漏
+
+验证/推理时忘记 `torch.no_grad()`，或者在循环中不断把张量 append 到列表，都会让显存持续增长。用 `torch.cuda.memory_allocated()` 观察每个 epoch 结束后的占用。
+
+## F.6 评测结果不一致
+
+评测差异通常来自预处理和后处理，而不是模型。按以下顺序对齐：
+
+### 输入预处理
+
+- resize 的插值方式（bilinear/bicubic/nearest）；
+- 是否保持长宽比、如何 padding；
+- 归一化均值/方差、通道顺序；
+- 输入范围（0–255 还是 0–1）；
+- 测试时是否使用 TTA、多尺度、翻转。
+
+### 输出后处理
+
+- 分类：类别顺序、top-k、阈值；
+- 检测：框格式（xyxy/xywh/cxcywh）、坐标是否归一化、NMS 阈值、最大检测数、分数阈值；
+- 分割：logits 的类别维、argmax 的轴、忽略类别；
+- 关键点：热图解码方式、是否加偏移、翻转关键点映射；
+- 3D：坐标系、框中心/底面中心、角度范围、BEV/3D IoU。
+
+### 评测脚本
+
+- TP/FP 匹配是贪心还是最优；
+- `ignore`/`difficult` 的处理；
+- AP 是 11 点、40 点还是全点插值；
+- 是否按类别平均、是否按样本加权；
+- 测试集版本和提交次数。
+
+最有效的调试方法是保存同一批输入的中间结果：预处理后的张量、模型输出、解码后的框、匹配结果。逐层对比参考实现，直到找到第一个不一致的位置。
+
+## F.7 部署后精度下降
+
+| 可能原因 | 检查 |
+|---|---|
+| 输入布局/通道顺序 | NCHW vs NHWC，RGB vs BGR |
+| 归一化不一致 | 均值/方差、0–1 vs 0–255 |
+| resize 插值不同 | 训练用 bilinear，部署用 nearest |
+| 量化误差 | FP32 vs FP16/INT8 的逐层误差 |
+| 动态 shape | 导出时固定尺寸，部署输入尺寸不同 |
+| 算子替换 | ONNX/TensorRT 不支持的算子被替换 |
+| NMS/后处理差异 | 阈值、坐标格式、类别顺序 |
+| BatchNorm folding | 推理时统计量与训练不一致 |
+
+建议做一个“数值对齐”测试：固定一张输入图，保存 PyTorch、ONNX、TensorRT 的中间输出，比较最大绝对误差和余弦相似度。精度下降不一定来自量化，很多时候是预处理在导出后被悄悄改了。
+
+## F.8 可复现性
+
+### 固定随机性
+
+```python
+import os
+import random
+import numpy as np
+import torch
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+```
+
+注意：`torch.manual_seed` 只影响 CPU 和当前 GPU 的随机数；多卡要 `manual_seed_all`。DataLoader 的 worker 需要单独设置种子，否则每个 epoch 的增强顺序可能不同。
+
+### 确定性开关
+
+```python
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+torch.use_deterministic_algorithms(True)
+```
+
+确定性算法可能变慢，且某些算子没有确定性实现。先保证实验可复现，再为性能放宽。
+
+### 常见非确定性来源
+
+- DataLoader 多 worker 的随机种子；
+- 多进程/多线程的浮点归约顺序；
+- CUDA 原子操作；
+- 分布式训练的 all-reduce 顺序；
+- 未排序的集合/字典遍历；
+- 文件系统返回文件的顺序；
+- 混合精度损失缩放的动态调整。
+
+完全确定性在 GPU 上很难保证。实践上做到：固定种子、记录环境、报告多种子均值；不要把“两次结果差 0.1 个点”当成方法不稳定，也不要把“只跑一次”当成确定结论。
+
+## F.9 数据问题
+
+- **标签错位**：图像与标签文件名不匹配；用可视化抽查 20 张。
+- **类别映射错误**：背景被当成第 0 类，或类别 id 不连续；检查 `class_to_idx`。
+- **重复样本**：训练集和验证集有相同/近重复图像；用哈希或感知哈希查重。
+- **坏数据**：损坏图像、全黑图、NaN 点云；在 Dataset 中做完整性检查。
+- **长尾**：某些类别只有几个样本；分层划分并报告每类指标。
+- **标注不一致**：同一目标多个标注员给出不同框；计算一致性（如 Cohen's kappa）并抽查。
+- **时间/场景泄漏**：相邻帧跨划分；按场景分组。
+
+数据问题的典型信号是“模型在训练集上也学不会”或“验证指标突然异常高”。先看数据，再看模型。
+
+## F.10 一个最小调试模板
+
+遇到问题时，按下面的顺序记录：
+
+```text
+1. 期望行为：
+2. 实际行为：
+3. 最小复现命令/脚本：
+4. 完整报错（含 traceback）：
+5. 环境：OS, Python, PyTorch, CUDA, GPU
+6. 数据：版本、划分、样本 id
+7. 已尝试的改动及结果：
+8. 怀疑的层级：数据 / 模型 / 损失 / 评测 / 部署
+```
+
+一个可运行的“最小复现”通常包含：固定种子、一个 batch、模型前向、损失计算、一次反向传播。把问题压缩到这个范围，大多数错误会自己暴露。
+
+### 调试检查清单
+
+- [ ] 输入和标签的形状、dtype、device 是否正确？
+- [ ] 单 batch 能否过拟合？
+- [ ] loss 的每个分量是否有限、量级合理？
+- [ ] 梯度是否存在、范数是否爆炸/消失？
+- [ ] 训练和验证的预处理是否完全一致？
+- [ ] 指标实现是否与官方脚本对齐？
+- [ ] 是否用测试集调过参？
+- [ ] 结果是否在多个种子上重复？
+- [ ] 部署前后的输入/输出是否数值对齐？
+- [ ] 是否记录了配置、commit 和环境？
+
+如果这十个问题都回答清楚，仍然解决不了，再向同事或社区求助。把最小复现和环境信息一起给出，通常能在几分钟内得到有效反馈，而不是来回猜测。

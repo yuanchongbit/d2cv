@@ -6,5 +6,26 @@ nocite: "@*"
 
 本页汇总全书引用的论文、数据集与技术报告。正文使用 `@key` 引用，条目统一维护在 `book/references.bib`。
 
+## 补充条目
+
+以下经典工作在正文中以文字形式提及，这里一并列出，方便检索：
+
+- LeCun et al., *Gradient-Based Learning Applied to Document Recognition*, 1998. [@lecun1998lenet]
+- Krizhevsky et al., *ImageNet Classification with Deep Convolutional Neural Networks*, 2012. [@krizhevsky2012alexnet]
+- Simonyan and Zisserman, *Very Deep Convolutional Networks for Large-Scale Image Recognition*, 2015. [@simonyan2015vgg]
+- Szegedy et al., *Going Deeper with Convolutions*, 2015. [@szegedy2015googlenet]
+- Ioffe and Szegedy, *Batch Normalization*, 2015. [@ioffe2015bn]
+- Huang et al., *Densely Connected Convolutional Networks*, 2017. [@huang2017densenet]
+- Howard et al., *MobileNets*, 2017. [@howard2017mobilenet]
+- Liu et al., *SSD: Single Shot MultiBox Detector*, 2016. [@liu2016ssd]
+- Chen et al., *SimCLR*, 2020. [@chen2020simclr]
+- He et al., *MoCo*, 2020. [@he2020moco]
+- He et al., *Masked Autoencoders Are Scalable Vision Learners*, 2022. [@he2022mae]
+- Liu et al., *Swin Transformer*, 2021. [@liu2021swin]
+- Liu et al., *A ConvNet for the 2020s*, 2022. [@liu2022convnext]
+- Oquab et al., *DINOv2*, 2024. [@oquab2024dinov2]
+
+## 完整文献表
+
 ::: {#refs}
 :::

@@ -5,16 +5,441 @@ title: "附录 A：数学速查"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
+- 用途：查阅，不必顺序阅读
 :::
 
-## 内容规划
+本附录汇总书中反复出现的数学工具，重点放在“公式在 CV 里对应什么”，而不是完整证明。每个小节末尾给出正文中的典型用法，遇到符号不清楚时可以回到这里。
 
-- 线性代数、概率、微积分与常用符号
-- 公式速查与几何直觉
-- 与正文符号表的对应关系
+## A.1 符号约定
 
-## 说明
+| 符号 | 含义 | 示例 |
+|---|---|---|
+| $a$ | 标量 | 学习率 $\eta$、阈值 $\tau$ |
+| $\mathbf{x}$ | 向量 | 一个像素的 RGB 值、一个 3D 点 |
+| $\mathbf{X}$ | 矩阵 | 一批特征、图像矩阵、内参 $K$ |
+| $\mathcal{X}$ | 张量/集合 | 特征图 $C\times H\times W$、数据集 |
+| $x_i$ | 向量第 $i$ 个元素 | 特征维度 |
+| $X_{ij}$ | 矩阵第 $i$ 行第 $j$ 列 | 权重矩阵 |
+| $\mathbf{x}^\top$ | 转置 | 内积 $\mathbf{x}^\top\mathbf{y}$ |
+| $\|\mathbf{x}\|_p$ | $p$ 范数 | $\|\mathbf{x}\|_2$ 为欧氏长度 |
+| $\nabla_{\mathbf{x}} f$ | 对 $\mathbf{x}$ 的梯度 | 反向传播 |
+| $\odot$ | 逐元素乘 | 掩码、门控 |
+| $\mathbf{1}[\cdot]$ | 指示函数 | 条件成立为 1 |
+| $\sim$ | 服从分布 | $y\sim\mathrm{Cat}(\mathbf{p})$ |
 
-本附录将随正文同步完善，优先保证与章节代码、术语和评测口径一致。
+本书默认向量是列向量；图像张量使用 $C\times H\times W$ 布局，批量使用 $B\times C\times H\times W$。索引从 0 开始，像素坐标 $(u,v)$ 中 $u$ 向右、$v$ 向下。
+
+## A.2 线性代数
+
+### 向量与范数
+
+内积与夹角：
+
+$$
+\mathbf{x}^\top\mathbf{y}=\sum_i x_i y_i=\|\mathbf{x}\|_2\|\mathbf{y}\|_2\cos\theta.
+$$
+
+常用范数：
+
+$$
+\|\mathbf{x}\|_1=\sum_i |x_i|,\qquad
+\|\mathbf{x}\|_2=\sqrt{\sum_i x_i^2},\qquad
+\|\mathbf{x}\|_\infty=\max_i |x_i|.
+$$
+
+$L_2$ 范数衡量长度，$L_1$ 范数常用于稀疏正则，$\|\mathbf{x}\|_\infty$ 衡量最大分量。余弦相似度只关心方向：
+
+$$
+\mathrm{cosine}(\mathbf{x},\mathbf{y})
+=\frac{\mathbf{x}^\top\mathbf{y}}{\|\mathbf{x}\|_2\|\mathbf{y}\|_2}.
+$$
+
+在检索和 CLIP 中，特征通常先做 $L_2$ 归一化，此时内积等于余弦相似度。
+
+### 矩阵运算
+
+- 形状：$\mathbf{A}\in\mathbb{R}^{m\times n}$ 表示 $m$ 行 $n$ 列；
+- 转置：$(\mathbf{A}^\top)_{ij}=A_{ji}$；
+- 乘法：$(\mathbf{A}\mathbf{B})_{ij}=\sum_k A_{ik}B_{kj}$，要求 $\mathbf{A}$ 的列数等于 $\mathbf{B}$ 的行数；
+- 逆：$\mathbf{A}^{-1}\mathbf{A}=\mathbf{I}$，仅方阵且满秩时存在；
+- 秩：线性无关的行/列数，决定矩阵能表示多少独立方向；
+- 迹：$\mathrm{tr}(\mathbf{A})=\sum_i A_{ii}$；
+- 行列式：$\det(\mathbf{A})$ 的绝对值是线性变换的体积缩放因子。
+
+正交矩阵满足 $\mathbf{Q}^\top\mathbf{Q}=\mathbf{I}$，它保持长度和角度，常用于旋转。二维旋转矩阵：
+
+$$
+\mathbf{R}(\theta)=
+\begin{bmatrix}
+\cos\theta & -\sin\theta\\
+\sin\theta & \cos\theta
+\end{bmatrix},
+\qquad
+\mathbf{R}(\theta)^{-1}=\mathbf{R}(-\theta)=\mathbf{R}(\theta)^\top.
+$$
+
+三维绕 $z$ 轴旋转（本书的偏航角约定）：
+
+$$
+\mathbf{R}_z(\theta)=
+\begin{bmatrix}
+\cos\theta & -\sin\theta & 0\\
+\sin\theta & \cos\theta & 0\\
+0 & 0 & 1
+\end{bmatrix}.
+$$
+
+### 特征值与 SVD
+
+方阵 $\mathbf{A}$ 的特征值 $\lambda$ 和特征向量 $\mathbf{v}$ 满足：
+
+$$
+\mathbf{A}\mathbf{v}=\lambda\mathbf{v}.
+$$
+
+特征值描述变换在特定方向上的缩放。正定矩阵的所有特征值为正，常用于协方差和二阶优化。
+
+任意矩阵 $\mathbf{A}\in\mathbb{R}^{m\times n}$ 都有奇异值分解：
+
+$$
+\mathbf{A}=\mathbf{U}\boldsymbol{\Sigma}\mathbf{V}^\top,
+$$
+
+其中 $\mathbf{U},\mathbf{V}$ 是正交矩阵，$\boldsymbol{\Sigma}$ 是对角矩阵，对角线是奇异值 $\sigma_1\ge\sigma_2\ge\cdots\ge0$。保留前 $k$ 个奇异值得到最优的低秩近似：
+
+$$
+\mathbf{A}_k=\sum_{i=1}^{k}\sigma_i\mathbf{u}_i\mathbf{v}_i^\top.
+$$
+
+LoRA 用低秩分解限制权重更新量，PCA 用协方差矩阵的主特征向量做降维，本质都与此相关。条件数是最大与最小奇异值之比：
+
+$$
+\kappa(\mathbf{A})=\frac{\sigma_{\max}}{\sigma_{\min}}.
+$$
+
+条件数越大，数值求解对噪声越敏感。训练中出现的病态 Hessian、归一化不当和特征尺度差异，都会表现为优化不稳定。
+
+### 齐次坐标与变换
+
+三维点 $\mathbf{p}=(x,y,z)^\top$ 的齐次表示为 $(x,y,z,1)^\top$。刚体变换写成 $4\times4$ 矩阵：
+
+$$
+\mathbf{p}'=
+\begin{bmatrix}
+\mathbf{R} & \mathbf{t}\\
+\mathbf{0}^\top & 1
+\end{bmatrix}
+\begin{bmatrix}
+\mathbf{p}\\1
+\end{bmatrix}
+=\mathbf{R}\mathbf{p}+\mathbf{t}.
+$$
+
+多个变换可以相乘：$T_{A\leftarrow C}=T_{A\leftarrow B}T_{B\leftarrow C}$。顺序不能交换，且求逆为：
+
+$$
+T^{-1}=
+\begin{bmatrix}
+\mathbf{R}^\top & -\mathbf{R}^\top\mathbf{t}\\
+\mathbf{0}^\top & 1
+\end{bmatrix}.
+$$
+
+第 19、25、26 章的坐标系转换都使用这一形式。一个常见错误是把旋转和平移的顺序写反，或者在求逆时忘记对平移做旋转。
+
+## A.3 微积分与优化
+
+### 导数、梯度与链式法则
+
+标量函数 $f(\mathbf{x})$ 的梯度是偏导组成的向量：
+
+$$
+\nabla_{\mathbf{x}}f=
+\begin{bmatrix}
+\frac{\partial f}{\partial x_1}, \ldots, \frac{\partial f}{\partial x_n}
+\end{bmatrix}^\top.
+$$
+
+复合函数 $f(g(\mathbf{x}))$ 的链式法则：
+
+$$
+\nabla_{\mathbf{x}} f(g(\mathbf{x}))
+=\mathbf{J}_g(\mathbf{x})^\top \nabla_{g} f,
+$$
+
+其中 $\mathbf{J}_g$ 是 $g$ 的雅可比矩阵，$J_{ij}=\partial g_i/\partial x_j$。反向传播就是按计算图从输出到输入反复应用链式法则。
+
+多元函数的二阶泰勒展开：
+
+$$
+f(\mathbf{x}+\Delta)
+\approx f(\mathbf{x})+\nabla f(\mathbf{x})^\top\Delta
++\frac12\Delta^\top\mathbf{H}(\mathbf{x})\Delta,
+$$
+
+其中 $\mathbf{H}$ 是 Hessian。梯度下降只利用一阶信息；牛顿法利用二阶信息，但计算和存储 Hessian 的成本很高。
+
+### 梯度下降家族
+
+最基础的更新：
+
+$$
+\boldsymbol{\theta}_{t+1}=\boldsymbol{\theta}_t-\eta\nabla_{\boldsymbol{\theta}}\mathcal{L}(\boldsymbol{\theta}_t).
+$$
+
+带动量：
+
+$$
+\mathbf{v}_{t+1}=\mu\mathbf{v}_t+\nabla_{\boldsymbol{\theta}}\mathcal{L}(\boldsymbol{\theta}_t),
+\qquad
+\boldsymbol{\theta}_{t+1}=\boldsymbol{\theta}_t-\eta\mathbf{v}_{t+1}.
+$$
+
+Adam 维护梯度的一阶和二阶矩估计：
+
+$$
+\mathbf{m}_{t+1}=\beta_1\mathbf{m}_t+(1-\beta_1)\mathbf{g}_t,
+\qquad
+\mathbf{v}_{t+1}=\beta_2\mathbf{v}_t+(1-\beta_2)\mathbf{g}_t^2,
+$$
+
+$$
+\hat{\mathbf{m}}=\frac{\mathbf{m}_{t+1}}{1-\beta_1^{t+1}},
+\qquad
+\hat{\mathbf{v}}=\frac{\mathbf{v}_{t+1}}{1-\beta_2^{t+1}},
+\qquad
+\boldsymbol{\theta}_{t+1}=\boldsymbol{\theta}_t-\eta\frac{\hat{\mathbf{m}}}{\sqrt{\hat{\mathbf{v}}}+\epsilon}.
+$$
+
+Adam 对每个参数自适应缩放步长，适合稀疏梯度和不同尺度的参数；但它不会自动解决错误的学习率、数据泄漏或标签错误。
+
+### 凸性与约束
+
+若函数满足
+
+$$
+f(\lambda\mathbf{x}+(1-\lambda)\mathbf{y})
+\le \lambda f(\mathbf{x})+(1-\lambda)f(\mathbf{y}),
+\quad \lambda\in[0,1],
+$$
+
+则称 $f$ 为凸函数。凸函数的局部最小值就是全局最小值。深度学习损失通常非凸，但局部几何、初始化和归一化仍会影响优化。
+
+带等式约束的优化可用拉格朗日乘子：
+
+$$
+\mathcal{L}(\mathbf{x},\lambda)=f(\mathbf{x})+\lambda g(\mathbf{x}),
+\qquad
+\nabla_{\mathbf{x}}\mathcal{L}=0,\quad g(\mathbf{x})=0.
+$$
+
+KKT 条件把等式约束推广到不等式约束。理解它有助于读懂带约束的检测框回归、最优传输和对抗攻击中的投影步骤。
+
+## A.4 概率与信息论
+
+### 基本规则
+
+条件概率与贝叶斯公式：
+
+$$
+P(A\mid B)=\frac{P(B\mid A)P(A)}{P(B)}.
+$$
+
+全概率公式：
+
+$$
+P(B)=\sum_i P(B\mid A_i)P(A_i).
+$$
+
+期望与方差：
+
+$$
+\mathbb{E}[X]=\sum_x xP(x),
+\qquad
+\mathrm{Var}(X)=\mathbb{E}[(X-\mathbb{E}[X])^2]
+=\mathbb{E}[X^2]-\mathbb{E}[X]^2.
+$$
+
+协方差衡量两个变量的线性相关性：
+
+$$
+\mathrm{Cov}(X,Y)=\mathbb{E}[(X-\mathbb{E}[X])(Y-\mathbb{E}[Y])].
+$$
+
+协方差为 0 不代表独立；它只说明没有线性相关。
+
+### 常见分布
+
+- 伯努利：$P(X=1)=p$，用于二分类；
+- 类别分布：$P(X=k)=p_k$，$\sum_k p_k=1$，用于多分类；
+- 高斯：$\mathcal{N}(\mu,\sigma^2)$，密度
+  $$
+  p(x)=\frac{1}{\sqrt{2\pi\sigma^2}}\exp\left(-\frac{(x-\mu)^2}{2\sigma^2}\right);
+  $$
+- 多元高斯：$\mathcal{N}(\boldsymbol{\mu},\boldsymbol{\Sigma})$，$\boldsymbol{\Sigma}$ 是协方差矩阵。
+
+### 熵、交叉熵与 KL
+
+熵衡量分布的不确定性：
+
+$$
+H(p)=-\sum_k p_k\log p_k.
+$$
+
+交叉熵：
+
+$$
+H(p,q)=-\sum_k p_k\log q_k.
+$$
+
+KL 散度：
+
+$$
+D_{\mathrm{KL}}(p\|q)=\sum_k p_k\log\frac{p_k}{q_k}
+=H(p,q)-H(p).
+$$
+
+KL 非负、不对称，且不满足三角不等式，所以不是距离。分类训练最小化交叉熵，等价于在标签分布 $p$ 固定时最小化 $D_{\mathrm{KL}}(p\|q)$。VAE 的 KL 项约束后验接近先验；知识蒸馏用 KL 让学生分布接近教师分布。
+
+### Softmax 与数值稳定
+
+$$
+\mathrm{softmax}(\mathbf{z})_i=\frac{e^{z_i}}{\sum_j e^{z_j}}.
+$$
+
+直接计算 $e^{z_i}$ 可能上溢。实现时先减去最大值：
+
+$$
+\mathrm{softmax}(\mathbf{z})_i
+=\frac{e^{z_i-m}}{\sum_j e^{z_j-m}},
+\qquad m=\max_j z_j.
+$$
+
+同理，$\log\sum_j e^{z_j}=m+\log\sum_j e^{z_j-m}$。PyTorch 的 `cross_entropy`、`log_softmax` 已包含这种稳定化；自己实现 sigmoid/softmax 时要注意。
+
+Sigmoid：
+
+$$
+\sigma(z)=\frac{1}{1+e^{-z}},
+\qquad
+\sigma'(z)=\sigma(z)(1-\sigma(z)).
+$$
+
+当 $|z|$ 很大时，$\sigma(z)$ 饱和，梯度接近 0。Focal Loss 通过 $(1-p)^\gamma$ 降低易分样本的权重，缓解正负样本不平衡。
+
+## A.5 几何与相机
+
+### 针孔相机模型
+
+相机坐标系下一点 $\mathbf{P}_c=(X,Y,Z)^\top$，投影到像素：
+
+$$
+u=f_x\frac{X}{Z}+c_x,
+\qquad
+v=f_y\frac{Y}{Z}+c_y.
+$$
+
+矩阵形式：
+
+$$
+Z
+\begin{bmatrix}u\\v\\1\end{bmatrix}
+=
+\mathbf{K}
+\begin{bmatrix}X\\Y\\Z\end{bmatrix},
+\qquad
+\mathbf{K}=
+\begin{bmatrix}
+f_x & 0 & c_x\\
+0 & f_y & c_y\\
+0 & 0 & 1
+\end{bmatrix}.
+$$
+
+$\mathbf{K}$ 是内参，$f_x,f_y$ 是以像素为单位的焦距，$(c_x,c_y)$ 是主点。加入外参：
+
+$$
+\mathbf{P}_c=\mathbf{R}_{\text{cam}\leftarrow\text{world}}\mathbf{P}_w+\mathbf{t},
+\qquad
+Z\begin{bmatrix}u\\v\\1\end{bmatrix}
+=\mathbf{K}(\mathbf{R}\mathbf{P}_w+\mathbf{t}).
+$$
+
+深度 $Z$ 是沿光轴的距离；如果模型预测的是到光心的欧氏距离 $d$，则 $Z=d\cos\phi$，不能直接混用。
+
+### 反投影
+
+已知像素 $(u,v)$ 和深度 $Z$：
+
+$$
+X=\frac{(u-c_x)Z}{f_x},
+\qquad
+Y=\frac{(v-c_y)Z}{f_y}.
+$$
+
+反投影对深度误差非常敏感：$X$ 的误差与 $Z$ 的误差成正比。双目视差 $d=u_L-u_R$ 与深度成反比：
+
+$$
+Z=\frac{f_x b}{d},
+$$
+
+其中 $b$ 是基线。视差很小的时候，深度误差会迅速放大。
+
+### 旋转表示
+
+- **旋转矩阵**：$3\times3$，正交且行列式为 1，9 个参数但有 6 个约束；
+- **欧拉角**：直观但有万向节锁，且不同库的旋转顺序不同；
+- **轴角**：一个单位轴加一个角度；
+- **四元数**：4 个参数，无奇异，插值平滑，nuScenes 等数据集常用；
+- **偏航角**：只绕 $z$ 轴旋转，3D 检测中最常见，但会丢失俯仰和横滚。
+
+在检测中统一使用偏航角时，要明确角度的零点和正方向。KITTI 相机坐标的旋转轴是向下的 $y$ 轴，不能直接套用车体 $z$ 轴的公式。
+
+### 2D/3D IoU
+
+轴对齐 2D 框：
+
+$$
+\mathrm{IoU}=\frac{\text{交集面积}}{\text{并集面积}}
+=\frac{A\cap B}{A+B-A\cap B}.
+$$
+
+旋转框的 BEV IoU 需要多边形裁剪；3D IoU 在 BEV 交集的基础上乘以高度区间的重叠：
+
+$$
+\mathrm{IoU}_{3D}
+=\frac{A_{\mathrm{BEV}}\cap B_{\mathrm{BEV}}\cdot h_{\mathrm{overlap}}}
+{V_A+V_B-A_{\mathrm{BEV}}\cap B_{\mathrm{BEV}}\cdot h_{\mathrm{overlap}}}.
+$$
+
+## A.6 正文符号索引
+
+| 符号 | 含义 | 出现章节 |
+|---|---|---|
+| $\mathbf{K}$ | 相机内参 | 19、25、26 |
+| $T_{A\leftarrow B}$ | 从 $B$ 到 $A$ 的齐次变换 | 19、25、26 |
+| $\mathrm{IoU}$ | 交并比 | 13、14、26 |
+| $\mathrm{AP}$ | 平均精度 | 13、14、26 |
+| $\mathrm{mIoU}$ | 平均交并比 | 15 |
+| $\mathrm{Dice}$ | Dice 系数 | 15、16 |
+| $\mathrm{OKS}$ | 目标关键点相似度 | 17 |
+| $\mathrm{MOTA}$ | 多目标跟踪准确率 | 18 |
+| $\theta$ | 偏航角/模型参数（按上下文） | 19、26 |
+| $\eta$ | 学习率 | 6、8、27 |
+| $\mathcal{L}$ | 损失函数 | 全书 |
+| $\sigma(\cdot)$ | sigmoid 或标准差（按上下文） | 6、27 |
+| $\tau$ | 阈值/温度 | 12、23、27 |
+
+## A.7 常用恒等式与技巧
+
+- **log-sum-exp**：$\log\sum_i e^{x_i}=m+\log\sum_i e^{x_i-m}$，$m=\max_i x_i$；
+- **sigmoid 与 softmax 的关系**：二分类 softmax 的一个分量等于 sigmoid；
+- **高斯积分**：$\int_{-\infty}^{\infty}e^{-x^2/2\sigma^2}\,dx=\sigma\sqrt{2\pi}$；
+- **Jensen 不等式**：对凸函数 $f$，$\mathbb{E}[f(X)]\ge f(\mathbb{E}[X])$；KL 非负性可由它推出；
+- **矩阵求导**：$\nabla_{\mathbf{x}}(\mathbf{a}^\top\mathbf{x})=\mathbf{a}$，$\nabla_{\mathbf{x}}(\mathbf{x}^\top\mathbf{A}\mathbf{x})=(\mathbf{A}+\mathbf{A}^\top)\mathbf{x}$；
+- **数值稳定**：除以方差时加 $\epsilon$，取对数前 clamp，计算 softmax 前减最大值；
+- **近似**：$e^x\approx1+x$（$x$ 接近 0），$\log(1+x)\approx x$，$\sin x\approx x$（小角度）。
+
+这些技巧不是“数学细节”，而是工程实现中区分“能跑”和“稳定”的关键。遇到 NaN、梯度爆炸或指标异常时，先回到本附录检查公式的符号、顺序和数值范围。

@@ -21,14 +21,17 @@
 
 ## 当前状态
 
-项目处于 **v0.1 骨架阶段**：
+**v1.0 初稿**：27 章正文与 6 个附录已全部写完，站点可构建、可部署。
 
 - [x] 项目大纲与章节规划（27 章 + 6 个附录）
 - [x] Quarto 书站与 GitHub Pages 部署
-- [x] `d2cv` 工具包骨架与测试
-- [x] CI（lint + pytest + 站点构建）
-- [ ] 批次 1：第 1–8 章正文
-- [ ] 批次 2–5 与全量 v1.0
+- [x] `d2cv` 工具包、测试与 CI
+- [x] 第 1–24 章正文（分类、检测、分割、3D、生成、多模态、部署、鲁棒性）
+- [x] 第 25–27 章正文（自动驾驶感知、3D 视觉、从复现到发表）
+- [x] 附录 A–F（数学、环境、数据集与指标、术语、文献、调试）
+- [ ] 全书技术审校与 v1.0 正式发布
+
+每章包含可运行代码、实验输出、工程坑、练习与延伸阅读。依赖较重或需要外部数据的单元标记为 `#| eval: false`，正文会说明运行条件。
 
 完整的章节规划、受众、设计原则与里程碑见 [OUTLINE.md](OUTLINE.md)。
 
@@ -39,7 +42,7 @@
 需要 Python 3.11+、[uv](https://docs.astral.sh/uv/)、[Quarto](https://quarto.org/)。
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --extra book
 source .venv/bin/activate
 ```
 
@@ -48,11 +51,11 @@ source .venv/bin/activate
 ### 构建书站
 
 ```bash
-quarto preview book
-quarto render book
+QUARTO_PYTHON="$PWD/.venv/bin/python" quarto preview book
+QUARTO_PYTHON="$PWD/.venv/bin/python" quarto render book
 ```
 
-输出在 `book/_site/`。
+输出在 `book/_site/`。`QUARTO_PYTHON` 用于确保 Quarto 使用项目虚拟环境，而不是系统 Python。
 
 ### 运行测试
 

@@ -5,16 +5,283 @@ title: "附录 C：数据集与指标手册"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
+- 用途：查数据集、查指标口径、写实验报告
 :::
 
-## 内容规划
+同一个指标名称，在不同数据集、不同评测脚本下可能完全不同。本附录先列出常用数据集，再按任务给出指标定义和报告要求。最后一节专门讲数据划分与泄漏，因为它是“指标很好但上线就崩”的最常见原因。
 
-- 常用数据集的来源、许可与规模
-- 分类/检测/分割/3D 的评测协议
-- 数据划分与复现注意事项
+## C.1 常用数据集
 
-## 说明
+| 数据集 | 任务 | 规模（约） | 类别/标注 | 许可与注意 |
+|---|---|---|---|---|
+| ImageNet-1K | 分类 | 128 万训练 / 5 万验证 | 1000 类 | 研究用途；图像版权各异 [@deng2009imagenet] |
+| CIFAR-10/100 | 分类 | 6 万张 32×32 | 10 / 100 类 | 研究用途 [@krizhevsky2009cifar] |
+| PASCAL VOC 2012 | 检测/分割 | 1.15 万张 | 20 类 | 研究用途 [@everingham2010voc] |
+| COCO 2017 | 检测/分割/关键点/描述 | 118k 训练 / 5k 验证 / 20k 测试 | 80 类 | 标注 CC BY 4.0；图像版权各异 [@lin2014coco] |
+| ADE20K | 语义分割 | 20k 训练 / 2k 验证 | 150 类 | 研究用途 [@zhou2017ade20k] |
+| Cityscapes | 语义/实例分割 | 5k 精细标注 | 19/30 类 | 非商业研究 [@cordts2016cityscapes] |
+| KITTI | 2D/3D 检测、深度、光流 | 7,481 训练 / 7,518 测试 | 汽车、行人、骑行者等 | CC BY-NC-SA 3.0 [@geiger2012kitti] |
+| nuScenes | 3D 检测、跟踪、预测 | 1000 场景、约 34 万关键帧 | 10 类、多传感器 | CC BY-NC-SA 4.0 [@caesar2020nuscenes] |
+| Waymo Open | 3D 检测/跟踪/分割 | 1,150 场景 | 车辆、行人、骑行者 | 非商业 [@sun2020waymo] |
+| MOT17/20 | 多目标跟踪 | 14 / 8 个视频 | 行人 | 研究用途 [@milan2016mot16] |
+| LAION-5B | 图文预训练 | 约 58.5 亿图文对 | 网络抓取 | 研究用途；版权与隐私风险高 [@schuhmann2022laion] |
 
-本附录将随正文同步完善，优先保证与章节代码、术语和评测口径一致。
+规模数字会随版本变化，写论文时应引用你实际使用的版本和下载日期。许可一栏只是提醒，**以数据集官网的最新条款为准**；商业使用前务必逐项确认，尤其是 KITTI、nuScenes、Cityscapes、Waymo 这类明确限制非商业用途的数据集。
+
+## C.2 分类指标
+
+### 准确率与 Top-k
+
+$$
+\mathrm{Acc}=\frac{1}{N}\sum_{i=1}^{N}\mathbf{1}[\hat y_i=y_i].
+$$
+
+Top-$k$ 准确率：真实类别出现在模型得分最高的 $k$ 个类别中的比例。ImageNet 常用 Top-1 和 Top-5。类别不平衡时，总体准确率会被大类主导，应同时报告：
+
+- **每类准确率/召回率**；
+- **宏平均（macro）**：先对每个类别算指标，再平均，所有类别等权；
+- **微平均（micro）**：先汇总所有样本的 TP/FP/FN，再算指标，大类主导；
+- **加权平均（weighted）**：按类别样本数加权；
+- **平衡准确率（balanced accuracy）**：每类召回率的平均。
+
+### 混淆矩阵与 P/R/F1
+
+二分类混淆矩阵：
+
+| | 预测正 | 预测负 |
+|---|---|---|
+| 真实正 | TP | FN |
+| 真实负 | FP | TN |
+
+$$
+P=\frac{TP}{TP+FP},
+\qquad
+R=\frac{TP}{TP+FN},
+\qquad
+F_1=\frac{2PR}{P+R}.
+$$
+
+多分类时，混淆矩阵的每一行是真实类别，每一列是预测类别。不要只看对角线之和；要检查哪些类别被系统性混淆。
+
+### ROC-AUC 与 PR-AUC
+
+ROC 曲线以假正率 $FPR=FP/(FP+TN)$ 为横轴、真正率 $TPR=TP/(TP+FN)$ 为纵轴。AUC 是曲线下面积，等价于随机取一个正样本和一个负样本，正样本得分更高的概率。PR 曲线以召回率为横轴、精确率为纵轴；在正样本稀少时，PR-AUC 比 ROC-AUC 更能反映实际性能。
+
+### 校准
+
+置信度校准衡量“模型说 0.8 时，实际正确率是否约为 0.8”。期望校准误差 [@guo2017calibration]：
+
+$$
+\mathrm{ECE}=\sum_{m=1}^{M}\frac{|B_m|}{N}
+\left|\mathrm{acc}(B_m)-\mathrm{conf}(B_m)\right|,
+$$
+
+其中 $B_m$ 是置信度落在第 $m$ 个区间的样本集合。ECE 依赖分箱方式，报告时要写清箱数和是否使用自适应分箱。温度缩放（temperature scaling）是常用的后处理校准方法。
+
+## C.3 检测指标
+
+### 匹配与 TP/FP/FN
+
+检测评测需要把预测框和真值框匹配。标准流程：
+
+1. 按类别分别处理；
+2. 预测按置信度从高到低排序；
+3. 每个预测与同类别、尚未匹配的真值计算 IoU；
+4. IoU 超过阈值且该真值未匹配，记为 TP，否则记为 FP；
+5. 未被匹配的真值记为 FN；
+6. 标为 `ignore` 或 `difficult` 的真值通常不参与 FP/FN 统计，但被匹配时可能被忽略。
+
+匹配是**贪心**的：先到先得，因此低分但位置更好的预测可能被高分预测“抢走”真值。不同实现的匹配细节会影响结果。
+
+### AP 与 mAP
+
+以召回率为横轴、精确率为纵轴，AP 是 PR 曲线下的面积。离散实现常用：
+
+- **11 点插值**：在 $R\in\{0,0.1,\ldots,1.0\}$ 处取右侧最大精确率，求平均；
+- **全点插值**：对每个召回率变化点计算精确率，再做数值积分（COCO 使用 101 点）；
+- **VOC 2007 11 点**与 **VOC 2010+ 全点**的结果不同，不能直接比较。
+
+$$
+\mathrm{AP}=\int_0^1 P(R)\,dR,
+\qquad
+\mathrm{mAP}=\frac{1}{C}\sum_{c=1}^{C}\mathrm{AP}_c.
+$$
+
+COCO 的主指标 `AP` 是在 IoU 阈值 $0.50,0.55,\ldots,0.95$ 上取平均，再对 80 类平均；`AP50` 和 `AP75` 是单阈值结果；还按目标面积分为 `AP-small`、`AP-medium`、`AP-large`。COCO 默认每张图最多 100 个检测，结果对 `maxDet` 敏感。
+
+### 3D 检测
+
+- **3D IoU**：在 BEV 交集基础上乘以高度重叠，见第 26 章；
+- **BEV IoU**：只在俯视图计算；
+- **KITTI**：按 Easy/Moderate/Hard 难度报告 3D AP 和 BEV AP，汽车常用 3D IoU 0.7，行人和骑行者常用 0.5；使用 40 个召回点（旧协议为 11 点）；
+- **nuScenes**：不使用 IoU 匹配，而用 BEV 中心距离阈值 $\{0.5,1,2,4\}$ 米；mAP 是各阈值、各类别的平均，NDS 还综合平移、尺度、朝向、速度、属性误差。
+
+KITTI 与 nuScenes 的 mAP 不能直接比较。即使都是 KITTI，使用本地验证集与官方测试服务器、不同难度过滤、不同 AP 实现，也会产生差异。
+
+### NMS 的影响
+
+Non-Maximum Suppression 按分数排序，保留高分框并抑制与其 IoU 超过阈值的框。NMS 阈值越高，保留的重叠框越多，召回可能上升但误检增加；阈值越低，重复框被抑制得越狠，密集场景可能漏检。报告检测指标时应写明 NMS 阈值、是否按类别做 NMS、以及最大检测数。
+
+## C.4 分割指标
+
+### 语义分割
+
+像素准确率：
+
+$$
+\mathrm{PA}=\frac{\sum_i n_{ii}}{\sum_{ij}n_{ij}},
+$$
+
+其中 $n_{ij}$ 是真实类别 $i$、预测类别 $j$ 的像素数。类别 $i$ 的 IoU：
+
+$$
+\mathrm{IoU}_i=\frac{n_{ii}}{\sum_j n_{ij}+\sum_j n_{ji}-n_{ii}}.
+$$
+
+mIoU 是各类 IoU 的平均。前景少、背景多时，PA 会被背景主导，mIoU 更能反映类别平衡。
+
+Dice 系数：
+
+$$
+\mathrm{Dice}=\frac{2|A\cap B|}{|A|+|B|}
+=\frac{2TP}{2TP+FP+FN}.
+$$
+
+Dice 与 IoU 的关系：$\mathrm{IoU}=\mathrm{Dice}/(2-\mathrm{Dice})$。二值分割中两者单调对应，但数值不同，不能混报。
+
+### 实例与全景分割
+
+实例分割的 mask AP 与检测 AP 类似，只是把框 IoU 换成 mask IoU，并在多个 mask IoU 阈值上平均。
+
+全景分割同时评估“stuff”和“thing”。Panoptic Quality [@kirillov2019panoptic]：
+
+$$
+\mathrm{PQ}
+=\frac{\sum_{(p,g)\in TP}\mathrm{IoU}(p,g)}
+{|TP|+\frac12|FP|+\frac12|FN|}
+=\mathrm{SQ}\times\mathrm{RQ},
+$$
+
+其中 SQ 是匹配段的平均 IoU，RQ 是匹配的 F1。PQ 把分割质量和识别质量拆开，但不能反映被忽略的小目标。
+
+### 边界与鲁棒性
+
+mIoU 对大目标更敏感，对小目标和细边界不敏感。需要评估边界质量时，使用 Boundary IoU 或按目标尺寸分层报告。自动驾驶中的远处小目标、遮挡目标应单独统计。
+
+## C.5 关键点与姿态
+
+COCO 关键点使用 Object Keypoint Similarity（OKS）：
+
+$$
+\mathrm{OKS}
+=\frac{\sum_i \exp\left(-\frac{d_i^2}{2s^2k_i^2}\right)\mathbf{1}[v_i>0]}
+{\sum_i \mathbf{1}[v_i>0]},
+$$
+
+其中 $d_i$ 是预测关键点与真值的欧氏距离，$s$ 是目标尺度（通常用框面积的开方），$k_i$ 是第 $i$ 个关键点的难度常数，$v_i$ 是可见性。OKS 对尺度归一化，因此大目标和小目标的误差被放在同一尺度上比较。
+
+PCK（Percentage of Correct Keypoints）定义为误差小于阈值的关键点比例；阈值可以是固定像素，也可以是头部长度的比例。PCK 的阈值选择会显著改变排名，报告时要说明。
+
+## C.6 多目标跟踪
+
+设 $FN$、$FP$、$IDS$ 分别为漏检、误检和 ID 切换数，$GT$ 为真值目标数。MOTA 的定义为 [@bernardin2007evaluating]：
+
+$$
+\mathrm{MOTA}=1-\frac{FN+FP+IDS}{GT}.
+$$
+
+MOTA 可能为负，且更偏向检测质量，无法充分反映 ID 的持续性。IDF1 衡量身份保持 [@ristani2016idf1]：
+
+$$
+\mathrm{IDF1}=\frac{2|IDTP|}{2|IDTP|+|IDFP|+|IDFN|}.
+$$
+
+HOTA 将检测准确率和关联准确率显式分解 [@luiten2020hota]，并对不同匹配阈值平均，近年逐渐取代单一 MOTA 成为更全面的指标。报告跟踪结果时至少给出 MOTA、IDF1、ID switches，以及按遮挡/距离分层的统计。
+
+## C.7 深度、点云与 3D 重建
+
+### 深度估计
+
+$$
+\mathrm{AbsRel}=\frac1N\sum_i\frac{|\hat d_i-d_i|}{d_i},
+\qquad
+\mathrm{RMSE}=\sqrt{\frac1N\sum_i(\hat d_i-d_i)^2},
+$$
+
+$$
+\mathrm{RMSE}_{\log}=\sqrt{\frac1N\sum_i(\log\hat d_i-\log d_i)^2},
+\qquad
+\delta<\tau:\ \max\left(\frac{\hat d_i}{d_i},\frac{d_i}{\hat d_i}\right)<\tau.
+$$
+
+常用 $\tau=1.25,1.25^2,1.25^3$。RMSE 对大误差敏感，AbsRel 更均衡；只报告一个指标容易掩盖远处深度的失败。
+
+### 点云与重建
+
+- **Chamfer Distance**：两组点云最近点距离的对称平均，衡量几何接近程度；
+- **F-score**：在距离阈值 $\tau$ 下计算精确率和召回率的调和平均；
+- **3D IoU / BEV IoU**：用于检测框和体素占用；
+- **深度图的点云覆盖率**：有效深度像素比例、空洞率、边缘处的 flying pixels。
+
+Chamfer Distance 对密度和采样敏感，比较不同方法时应固定采样点数，并同时报告 F-score。
+
+## C.8 生成模型指标
+
+- **FID**：把真实图像和生成图像分别送入 Inception 网络，拟合特征的高斯分布，计算 Fréchet 距离。越低越好，但依赖特征网络、样本量和图像预处理 [@heusel2017fid]。
+- **IS**：衡量生成图像的类别置信度和多样性；越高越好，但对非 ImageNet 数据和过拟合不敏感。
+- **CLIPScore**：图文相似度，适合文本到图像生成，但不能替代人类对真实性、构图和细节的评价。
+- **生成精确率/召回率**：分别衡量样本质量和覆盖度，比单一 FID 更能揭示模式崩溃。
+
+FID 的样本量、resize 方式和实现版本都会影响数值。报告时要写清：多少张图、用什么特征网络、是否用官方脚本、是否使用水平翻转等。
+
+## C.9 数据划分与泄漏
+
+### 划分原则
+
+- **训练集**：更新参数；
+- **验证集**：选模型、调超参、早停；
+- **测试集**：只在最后评估一次。
+
+常见错误：
+
+1. 用测试集调参，再报告测试集上的最好结果；
+2. 同一场景/患者/车辆的相邻帧被分到不同集合；
+3. 预处理时用全体数据计算均值、方差或词典；
+4. 预训练数据与测试数据重叠；
+5. 数据增强把测试图像变体泄漏到训练（例如同一原图的裁剪）；
+6. 类别不平衡时随机划分导致小类在某一侧缺失。
+
+### 分组与分层
+
+- **分组划分**：按场景、患者、城市、日期分组，保证同一组只出现在一个集合；
+- **时间划分**：用较早数据训练、较晚数据测试，模拟部署时的时间分布；
+- **地理划分**：用不同城市/区域测试，检验泛化；
+- **分层划分**：按类别/难度分层，保证各集合分布接近。
+
+自动驾驶和医学影像尤其要按场景/患者分组。随机按帧划分会让同一段路的相邻帧同时出现在训练和验证中，指标会大幅虚高。
+
+### 长尾与标签噪声
+
+- 报告每类样本数、每类指标和混淆矩阵；
+- 对长尾类别使用重采样、重加权或分组报告；
+- 检查标注一致性（多人标注的 Cohen's kappa）；
+- 对疑似错误标签做抽查，不要假设 benchmark 标签绝对正确。
+
+## C.10 指标报告模板
+
+一份可比较的实验报告至少包含：
+
+```text
+dataset / version / split:
+metric implementation (script, commit):
+matching rule (IoU threshold / center distance):
+post-processing (NMS, TTA, max detections):
+number of runs and seeds:
+mean ± std (or confidence interval):
+hardware and runtime:
+known deviations from the official protocol:
+```
+
+如果只写“mAP 提升了 2 个点”，读者无法判断这是方法改进、评测差异还是选择偏差。把口径写清楚，是对读者也是对自己负责。

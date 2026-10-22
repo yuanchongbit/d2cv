@@ -5,66 +5,277 @@ title: "附录 B：环境与依赖"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-writing">写作中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
+- 适用：本地阅读、运行书中代码、构建站点
 :::
 
-## 推荐环境
+本书的正文实验只依赖 PyTorch、torchvision、NumPy、Matplotlib 和 Pillow。检测、3D、生成、多模态章节中的“调库实现”会用到额外依赖，但它们都放在可选 extra 中，不影响核心章节。建议先装最小环境，跑通第 3–8 章，再按需安装。
 
-| 组件 | 版本 | 说明 |
-|---|---|---|
-| Python | 3.12 | 最低 3.11 |
-| PyTorch | 2.x | 按 CUDA/MPS/CPU 选择官方安装命令 |
-| torchvision | 与 PyTorch 匹配 | 预训练权重与数据增强 |
-| Quarto | 1.6+ | 书站构建 |
-| uv | 最新稳定版 | Python 环境与依赖管理 |
+## B.1 支持矩阵
 
-## 安装
+| 组件 | 推荐版本 | 最低版本 | 说明 |
+|---|---|---|---|
+| Python | 3.12 | 3.11 | 3.10 未测试 |
+| PyTorch | 2.14（本书构建时） | 2.3 | CPU/CUDA/MPS 均可 |
+| torchvision | 0.29（本书构建时） | 0.18 | 与 PyTorch 版本匹配 |
+| NumPy | 1.26+ | 1.26 | 2.x 也可 |
+| Matplotlib | 3.8+ | 3.8 | 绘图 |
+| Pillow | 10.2+ | 10.2 | 图像读写 |
+| Quarto | 1.6+ | 1.6 | 书站构建 |
+| Jupyter | 1.x | — | Quarto 执行代码 |
+| uv | 最新稳定版 | — | 可选，推荐用于锁依赖 |
+
+操作系统：macOS（Apple Silicon/Intel）、Linux、Windows + WSL2。Windows 原生环境未系统测试，路径和符号链接可能出问题，建议用 WSL2。
+
+GPU 不是必需的。第 3–18、22–24 章的大部分实验可以在 CPU 上完成；第 12、20、21 章的预训练模型推理在 CPU 上会慢一些；真实数据训练建议 12 GB 以上显存。
+
+## B.2 安装
+
+### 方式一：uv（推荐）
 
 ```bash
-uv sync --extra dev
+cd d2cv
+uv sync --extra dev --extra book
 source .venv/bin/activate
 ```
 
-如果需要特定 CUDA 版本，先按 [PyTorch 官方安装页](https://pytorch.org/get-started/locally/) 安装 `torch` 和 `torchvision`，再执行 `uv sync`。
+`uv sync` 会根据 `pyproject.toml` 创建 `.venv` 并安装依赖。若你使用 CUDA，先按 [PyTorch 官方安装页](https://pytorch.org/get-started/locally/) 的对应命令安装 `torch`/`torchvision`，再执行 `uv sync`，避免 uv 装成 CPU 版。
 
-## 验证
+### 方式二：venv + pip
+
+```bash
+cd d2cv
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -e ".[dev,book]"
+```
+
+如果需要特定 CUDA 版本，先安装对应 wheel：
+
+```bash
+# 示例：CUDA 12.4，具体命令以 PyTorch 官网为准
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+```
+
+然后再执行 `pip install -e ".[dev,book]"`，pip 会复用已安装的 torch。
+
+### 方式三：只读不跑
+
+只想阅读站点、不执行代码：
+
+```bash
+quarto preview book
+```
+
+Quarto 会使用已提交的 `book/_freeze` 缓存，不需要本地 Python 环境。修改了代码单元并希望重新执行时，才需要完整环境。
+
+## B.3 可选依赖
+
+`pyproject.toml` 把重型依赖拆成 extra：
+
+| extra | 包含 | 用途 |
+|---|---|---|
+| `dev` | pytest、ruff、ipykernel、jupyterlab | 开发与测试 |
+| `book` | jupyter、ipykernel | Quarto 执行 |
+| `det` | ultralytics、albumentations、opencv-python-headless | 第 14、25 章检测基线 |
+| `cv3d` | open3d、opencv-python-headless | 第 19、26 章点云与 3D |
+| `gen` | diffusers、transformers、accelerate、safetensors | 第 20 章生成模型 |
+| `vlm` | transformers、accelerate、sentencepiece | 第 21 章多模态 |
+
+按需安装：
+
+```bash
+pip install -e ".[det]"
+pip install -e ".[gen,vlm]"
+```
+
+这些库的版本迭代很快，书中相关代码通常标记为 `#| eval: false`，并在正文中给出接口说明。真正运行前请查阅对应版本的文档。
+
+## B.4 验证环境
 
 ```bash
 python scripts/check_env.py
 pytest
-quarto render book --no-execute
 ```
 
-## 常见问题
+`check_env.py` 会打印 Python、PyTorch、torchvision 版本，以及 CUDA/MPS 可用性。`pytest` 运行 `tests/` 下的工具函数测试。
 
-### 有 GPU 但 `torch.cuda.is_available()` 为 False
-
-先确认安装的是 CUDA 版而不是 CPU 版：
+构建整本书：
 
 ```bash
-python -c "import torch; print(torch.__version__, torch.version.cuda)"
+QUARTO_PYTHON="$PWD/.venv/bin/python" quarto render book
 ```
 
-如果版本号里没有 `+cu`，重新安装对应 CUDA 版本的 wheel。
+只构建一章：
 
-### Apple Silicon 上 MPS 报错
+```bash
+QUARTO_PYTHON="$PWD/.venv/bin/python" quarto render book/03-image-basics/index.qmd
+```
 
-部分算子尚未在 MPS 上实现。遇到 `NotImplementedError` 时，把该算子或整个实验切到 CPU：
+预览：
+
+```bash
+QUARTO_PYTHON="$PWD/.venv/bin/python" quarto preview book
+```
+
+`QUARTO_PYTHON` 很重要：Quarto 默认可能调用系统 Python，而不是你的 `.venv`。如果代码单元报 `ModuleNotFoundError`，先确认 Quarto 用的是哪个解释器。
+
+## B.5 关于 `_freeze`
+
+本书开启 `execute: freeze: auto`，执行结果保存在 `book/_freeze/`。构建站点时，如果源文件哈希没有变化，Quarto 直接复用缓存，不重新执行代码。这带来三个好处：
+
+- CI 不需要 GPU 和重型依赖也能构建；
+- 构建时间稳定；
+- 读者看到的输出与作者提交时一致。
+
+因此 `_freeze` 必须提交到仓库，不能加入 `.gitignore`。修改代码单元后，Quarto 会自动重新执行该章并更新缓存；如果只想改文字，不会触发执行。
+
+强制重新执行某一章：
+
+```bash
+QUARTO_PYTHON="$PWD/.venv/bin/python" quarto render book/03-image-basics/index.qmd --execute
+```
+
+::: {.callout-warning}
+## 不要删除整个 `_freeze`
+
+删除后，下一次构建会尝试执行全书。缺少可选依赖或 GPU 时，构建可能失败。若确实需要清理，只删除对应章节的缓存目录，并在完整环境中重新构建。
+:::
+
+## B.6 GPU、CUDA 与 MPS
+
+检查 PyTorch 是否能识别 GPU：
 
 ```python
-device = torch.device("cpu")
+import torch
+print("torch:", torch.__version__)
+print("cuda build:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+print("mps available:", torch.backends.mps.is_available())
+if torch.cuda.is_available():
+    print(torch.cuda.get_device_name(0))
 ```
 
-### 显存不足
+### CUDA 版装成了 CPU 版
 
-优先尝试：减小 batch size、开启 AMP、使用梯度累积、冻结骨干、降低输入分辨率。不要先改模型结构。
+症状：`torch.cuda.is_available()` 为 `False`，`torch.version.cuda` 为 `None`。解决：卸载后按官网命令安装 CUDA wheel；不要只 `pip install torch`，PyPI 默认可能是 CPU 版。
 
-### Quarto 找不到 Jupyter 内核
+### Apple Silicon 的 MPS
 
-确认当前虚拟环境安装了 `ipykernel`，并在该环境中启动 Quarto：
+部分算子尚未在 MPS 上实现，遇到 `NotImplementedError` 时：
+
+```python
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+```
+
+如果某个算子仍失败，把该实验切到 CPU，或在代码中捕获异常回退。不要假设 MPS 与 CUDA 行为完全一致，数值精度和算子支持都可能有差异。
+
+### 多卡
+
+书中代码以单卡/CPU 为主。多卡训练需要 `DistributedDataParallel` 或框架封装，超出本书范围；如果你要扩展到多卡，先确认数据划分、学习率缩放和日志聚合，否则很容易得到不可复现的结果。
+
+## B.7 常见问题
+
+### `ModuleNotFoundError: No module named 'torch'`
+
+1. 确认已激活虚拟环境：`which python`；
+2. 确认 Quarto 使用同一解释器：设置 `QUARTO_PYTHON`；
+3. 在 Jupyter 中检查 `import sys; print(sys.executable)`。
+
+### Quarto 报 “No such kernel named python3”
+
+在虚拟环境中安装并注册内核：
 
 ```bash
-source .venv/bin/activate
-quarto check
+pip install ipykernel
+python -m ipykernel install --user --name d2cv --display-name "Python (d2cv)"
 ```
+
+然后在 Quarto 配置中指定 `jupyter: d2cv`。本书默认使用 `python3`，通常设置 `QUARTO_PYTHON` 即可。
+
+### `ImportError: libGL.so.1` / OpenCV 相关错误
+
+服务器环境缺少图形库。安装 `opencv-python-headless` 而不是 `opencv-python`，或安装系统依赖：
+
+```bash
+# Ubuntu/Debian 示例
+sudo apt-get install libgl1
+```
+
+### 显存不足（CUDA out of memory）
+
+按成本从低到高尝试：
+
+1. 减小 batch size；
+2. 开启 AMP（`torch.autocast`）；
+3. 梯度累积；
+4. 降低输入分辨率；
+5. 冻结骨干；
+6. 使用梯度检查点；
+7. 换更大显存的卡。
+
+不要第一步就改模型结构。先确认显存被谁占用：
+
+```python
+print(torch.cuda.memory_summary())
+```
+
+### 训练很慢
+
+- 确认数据加载不是瓶颈：`num_workers`、pin memory、预处理是否在 CPU 上重复做；
+- 确认 GPU 利用率：`nvidia-smi -l 1`；
+- 确认没有频繁 `.item()`、`.cpu()` 或 Python 循环打断 GPU 流水线；
+- 确认 batch size 不是小到无法饱和 GPU；
+- 混合精度和 `torch.compile` 可能带来加速，但要先保证正确性。
+
+### 结果不可复现
+
+见附录 F 的“可复现性”一节。最低要求：固定 Python/NumPy/PyTorch 种子，记录配置和硬件，避免依赖未排序的集合/字典顺序，DataLoader 的 shuffle 种子也要固定。
+
+### 磁盘空间不足
+
+模型权重、数据集和 `_site` 可能占用数十 GB。清理时只删除自己生成的缓存，不要删除 `_freeze`、数据清单或未提交的实验日志。先看占用：
+
+```bash
+du -sh .venv book/_site book/_freeze ~/.cache/torch 2>/dev/null
+```
+
+## B.8 记录环境
+
+论文或项目报告至少记录：
+
+```text
+OS / architecture:
+Python:
+PyTorch / torchvision:
+CUDA / driver:
+GPU model and count:
+Quarto:
+key extras and versions:
+git commit:
+```
+
+可以用以下命令生成一份快照：
+
+```bash
+python -c "import sys, torch, torchvision; print(sys.version); print(torch.__version__, torchvision.__version__, torch.version.cuda)"
+pip freeze > environment-lock.txt
+git rev-parse HEAD
+```
+
+`pip freeze` 会包含所有传递依赖，适合归档；`pyproject.toml` 适合表达直接依赖。两者都保留最稳妥。
+
+## B.9 从零到运行 checklist
+
+1. 安装 Python 3.11+ 和 Quarto 1.6+；
+2. 创建虚拟环境并安装 `.[dev,book]`；
+3. 运行 `python scripts/check_env.py`；
+4. 运行 `pytest`；
+5. 用 `QUARTO_PYTHON` 构建一章；
+6. 打开 `book/_site/index.html` 检查代码输出；
+7. 按需安装 `det`、`cv3d`、`gen`、`vlm` extra；
+8. 记录环境快照和 git commit。
+
+如果这 8 步都通过，后续章节的环境问题基本可以排除。遇到问题时，先提供最小复现、完整报错、环境快照和已尝试的操作，比只说“跑不起来”更容易得到有效帮助。

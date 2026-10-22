@@ -5,16 +5,268 @@ title: "附录 D：术语中英对照"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
+- 用途：写作、读论文、统一团队用语
 :::
 
-## 内容规划
+同一个英文术语在不同社区可能有不同译法。本附录给出本书的统一译法，并标注容易混淆的概念。写代码、写论文或做技术评审时，优先使用英文原名，第一次出现时附中文解释，避免“翻译后的术语”造成歧义。
 
-- 全书术语统一译法
-- 易混淆概念辨析
-- 按章节索引
+## D.1 基础与训练
 
-## 说明
+| 中文 | English | 说明 |
+|---|---|---|
+| 张量 | tensor | 多维数组；本书默认 $C\times H\times W$ 布局 |
+| 标量 / 向量 / 矩阵 | scalar / vector / matrix | 0 / 1 / 2 维张量 |
+| 广播 | broadcasting | 形状不同的张量按规则扩展后逐元素运算 |
+| 形状 | shape | 各维度大小；调试时先打印 shape |
+| 数据类型 | dtype | `float32`、`float16`、`int8` 等 |
+| 设备 | device | CPU / CUDA / MPS |
+| 梯度 | gradient | 损失对参数的偏导 |
+| 反向传播 | backpropagation | 按计算图反向应用链式法则 |
+| 自动微分 | automatic differentiation | PyTorch 的 `autograd` |
+| 计算图 | computational graph | 记录算子依赖关系 |
+| 损失函数 | loss function | 优化目标 |
+| 优化器 | optimizer | SGD、Adam 等更新规则 |
+| 学习率 | learning rate | 步长 $\eta$ |
+| 权重衰减 | weight decay | $L_2$ 正则的常见实现 |
+| 批量 | batch | 一次前向/反向的样本集合 |
+| 随机梯度下降 | stochastic gradient descent (SGD) | 用小批量梯度估计全量梯度 |
+| 动量 | momentum | 累积历史梯度方向 |
+| 早停 | early stopping | 验证集不再提升时停止训练 |
+| 过拟合 | overfitting | 训练集好、验证集差 |
+| 欠拟合 | underfitting | 训练集和验证集都差 |
+| 正则化 | regularization | 限制模型复杂度 |
+| 数据增强 | data augmentation | 随机变换扩充训练分布 |
+| 混合精度 | mixed precision | FP16/BF16 与 FP32 混合训练 |
+| 梯度裁剪 | gradient clipping | 限制梯度范数，防止爆炸 |
+| 归一化 | normalization | 将数值缩放到稳定范围 |
+| 标准化 | standardization | 减均值、除标准差 |
+| 批归一化 | batch normalization | 按 batch 统计量归一化 |
+| 层归一化 | layer normalization | 按单样本特征归一化 |
+| 残差连接 | residual connection | $y=x+f(x)$，缓解深层退化 |
+| 激活函数 | activation function | ReLU、GELU、SiLU 等 |
+| 感受野 | receptive field | 输出像素对应的输入区域 |
+| 步长 | stride | 卷积/池化的滑动间隔 |
+| 填充 | padding | 边界补零或复制 |
+| 空洞卷积 | dilated convolution | 扩大感受野而不增加参数 |
+| 转置卷积 | transposed convolution | 上采样；不是卷积的严格逆 |
+| 池化 | pooling | 最大/平均聚合 |
+| 全局平均池化 | global average pooling (GAP) | 将 $H\times W$ 压成 1×1 |
 
-本附录将随正文同步完善，优先保证与章节代码、术语和评测口径一致。
+## D.2 分类与骨干
+
+| 中文 | English | 说明 |
+|---|---|---|
+| 骨干网络 | backbone | 提取特征的主干 |
+| 颈部 | neck | 融合多尺度特征的模块，如 FPN |
+| 头部 | head | 输出分类/框/掩码的任务头 |
+| 预训练 | pretraining | 在大规模数据上先训练 |
+| 微调 | fine-tuning | 在目标任务上继续训练 |
+| 线性探测 | linear probing | 冻结骨干，只训练线性分类头 |
+| 冻结 | freezing | 固定部分参数不更新 |
+| 自监督学习 | self-supervised learning (SSL) | 用数据自身构造监督信号 |
+| 对比学习 | contrastive learning | 拉近正样本、推远负样本 |
+| 掩码建模 | masked modeling | 遮挡部分输入并预测 |
+| 知识蒸馏 | knowledge distillation | 用教师模型指导学生学习 |
+| 位置编码 | positional encoding | 给序列元素注入位置信息 |
+| 注意力 | attention | 按相关性加权聚合 |
+| 自注意力 | self-attention | 序列内部元素互相注意 |
+| 多头注意力 | multi-head attention | 多个子空间并行注意 |
+| 归纳偏置 | inductive bias | 模型结构自带的先验假设 |
+| 平移等变性 | translation equivariance | 输入平移导致输出同样平移 |
+| 尺度不变性 | scale invariance | 目标尺度变化不影响识别 |
+| 线性层 | linear layer | 全连接层 |
+| 嵌入 | embedding | 离散 token/类别的连续向量 |
+
+## D.3 目标检测
+
+| 中文 | English | 说明 |
+|---|---|---|
+| 目标检测 | object detection | 定位并分类目标 |
+| 边界框 | bounding box | 本书使用 `xyxy` 格式 |
+| 锚框 | anchor | 预置的参考框 |
+| 先验框 | prior box | 与 anchor 常混用 |
+| 交并比 | intersection over union (IoU) | 重叠程度 |
+| 非极大值抑制 | non-maximum suppression (NMS) | 去除重复框 |
+| 单阶段检测器 | one-stage detector | YOLO、FCOS、RetinaNet 等 |
+| 两阶段检测器 | two-stage detector | Faster R-CNN 等 |
+| 区域提议网络 | region proposal network (RPN) | 生成候选框 |
+| 兴趣区域 | region of interest (RoI) | 待池化的区域 |
+| 特征金字塔 | feature pyramid network (FPN) | 多尺度特征融合 |
+| 焦点损失 | focal loss | 降低易分样本权重 |
+| 正样本 | positive sample | 与真值匹配的样本 |
+| 负样本 | negative sample | 背景样本 |
+| 难负样本挖掘 | hard negative mining | 重点训练易误检背景 |
+| 标签分配 | label assignment | 决定哪些位置负责哪个真值 |
+| 匈牙利匹配 | Hungarian matching | DETR 的二分图匹配 |
+| 平均精度 | average precision (AP) | PR 曲线下面积 |
+| 平均精度均值 | mean average precision (mAP) | 各类别 AP 的平均 |
+| 置信度 | confidence score | 分类分数，不必然校准 |
+| 召回率 | recall | 找回的真值比例 |
+| 精确率 | precision | 预测为正且正确的比例 |
+| 误检 | false positive (FP) | 背景被判为正 |
+| 漏检 | false negative (FN) | 正样本未被发现 |
+| 长尾 | long tail | 少数类别样本极少 |
+| 开放词汇检测 | open-vocabulary detection | 检测训练时未见的类别 |
+| 旋转框 | oriented bounding box (OBB) | 带角度的框 |
+| 无锚框 | anchor-free | 直接预测关键点/中心 |
+
+## D.4 分割
+
+| 中文 | English | 说明 |
+|---|---|---|
+| 语义分割 | semantic segmentation | 每个像素分类，不区分实例 |
+| 实例分割 | instance segmentation | 区分同一类别的不同个体 |
+| 全景分割 | panoptic segmentation | 语义 + 实例 |
+| 掩码 | mask | 像素级二值/类别图 |
+| 编码器-解码器 | encoder-decoder | 先降采样再恢复分辨率 |
+| 跳跃连接 | skip connection | 将浅层特征传给解码器 |
+| 空洞空间金字塔池化 | atrous spatial pyramid pooling (ASPP) | 多尺度空洞卷积 |
+| 平均交并比 | mean IoU (mIoU) | 各类 IoU 平均 |
+| Dice 系数 | Dice coefficient | 与 IoU 单调对应但数值不同 |
+| 像素准确率 | pixel accuracy | 正确像素比例 |
+| 边界 IoU | boundary IoU | 只评估边界附近区域 |
+| 提示分割 | promptable segmentation | 用点/框/文本提示分割 |
+| 零样本分割 | zero-shot segmentation | 未见类别也能分割 |
+| 全景质量 | panoptic quality (PQ) | 分割质量 × 识别质量 |
+| 实例掩码 AP | mask AP | 用 mask IoU 匹配 |
+
+## D.5 关键点、视频与跟踪
+
+| 中文 | English | 说明 |
+|---|---|---|
+| 关键点 | keypoint | 人体关节、面部点等 |
+| 姿态估计 | pose estimation | 预测关键点位置 |
+| 热图 | heatmap | 每个关键点一张概率图 |
+| 关键点相似度 | object keypoint similarity (OKS) | COCO 的关键点指标 |
+| 正确关键点比例 | percentage of correct keypoints (PCK) | 阈值内的关键点比例 |
+| 自顶向下 | top-down | 先检测人，再估计姿态 |
+| 自底向上 | bottom-up | 先检测关键点，再组装 |
+| 光流 | optical flow | 像素运动场 |
+| 多目标跟踪 | multi-object tracking (MOT) | 检测 + 关联 |
+| 卡尔曼滤波 | Kalman filter | 线性高斯状态估计 |
+| 数据关联 | data association | 将检测分配给轨迹 |
+| 轨迹 | track | 同一目标的时序序列 |
+| ID 切换 | ID switch | 目标身份被错误切换 |
+| 遮挡 | occlusion | 目标被其他物体挡住 |
+| 多目标跟踪准确率 | MOTA | 检测错误的综合指标 |
+| IDF1 | ID F1 | 身份保持指标 |
+| HOTA | higher order tracking accuracy | 检测与关联的联合指标 |
+
+## D.6 3D、深度与生成
+
+| 中文 | English | 说明 |
+|---|---|---|
+| 点云 | point cloud | 三维点集合 |
+| 体素 | voxel | 三维网格单元 |
+| 柱体 | pillar | BEV 平面上的柱状单元 |
+| 鸟瞰图 | bird's-eye view (BEV) | 从上方看的平面表示 |
+| 占用栅格 | occupancy grid | 每个格子的占用概率 |
+| 深度估计 | depth estimation | 预测每个像素的距离 |
+| 视差 | disparity | 双目左右图像的像素差 |
+| 双目 | stereo | 两个相机 |
+| 单目 | monocular | 单个相机 |
+| 神经辐射场 | neural radiance field (NeRF) | 隐式场景表示 |
+| 3D 高斯泼溅 | 3D Gaussian splatting (3DGS) | 显式高斯基元表示 |
+| 新视角合成 | novel view synthesis | 从新视角渲染场景 |
+| 生成模型 | generative model | 学习数据分布并采样 |
+| 变分自编码器 | variational autoencoder (VAE) | 潜变量生成模型 |
+| 生成对抗网络 | generative adversarial network (GAN) | 生成器与判别器博弈 |
+| 扩散模型 | diffusion model | 学习去噪过程 |
+| 去噪 | denoising | 从噪声恢复数据 |
+| 潜空间 | latent space | 压缩后的表示空间 |
+| 无分类器引导 | classifier-free guidance (CFG) | 条件/无条件预测的组合 |
+| 采样器 | sampler | DDPM/DDIM/Euler 等 |
+| FID | Fréchet inception distance | 生成分布与真实分布的距离 |
+| 模式崩溃 | mode collapse | 生成器只覆盖少数模式 |
+| 可控生成 | controllable generation | 用文本/布局/姿态控制输出 |
+
+## D.7 多模态
+
+| 中文 | English | 说明 |
+|---|---|---|
+| 多模态 | multimodal | 图像、文本、音频等联合建模 |
+| 视觉语言模型 | vision-language model (VLM) | 同时处理图像和文本 |
+| 对比语言-图像预训练 | contrastive language-image pretraining (CLIP) | 图文对比学习 |
+| 零样本分类 | zero-shot classification | 用文本描述分类未见类别 |
+| 图文检索 | image-text retrieval | 图找文/文找图 |
+| 视觉问答 | visual question answering (VQA) | 根据图像回答问题 |
+| 图像描述 | image captioning | 生成图像的文字描述 |
+| 指令微调 | instruction tuning | 用指令-回答数据微调 |
+| 幻觉 | hallucination | 生成看似合理但错误的内容 |
+| 接地 | grounding | 将文本指代定位到图像区域 |
+| 开放词汇 | open-vocabulary | 支持训练时未见的类别/概念 |
+| 提示 | prompt | 输入给模型的文本/视觉线索 |
+| 适配器 | adapter | 插入预训练模型的轻量模块 |
+| LoRA | low-rank adaptation | 低秩权重更新 |
+
+## D.8 数据、部署与可靠性
+
+| 中文 | English | 说明 |
+|---|---|---|
+| 数据清单 | datasheet | 记录数据集动机、组成、许可 |
+| 模型卡 | model card | 记录模型用途、指标、限制 |
+| 数据泄漏 | data leakage | 测试信息进入训练 |
+| 分布偏移 | distribution shift | 部署分布与训练分布不同 |
+| 域适应 | domain adaptation | 用目标域数据适配 |
+| 域泛化 | domain generalization | 不访问目标域也保持性能 |
+| 鲁棒性 | robustness | 对噪声/攻击/扰动的稳定性 |
+| 对抗样本 | adversarial example | 精心扰动使模型出错 |
+| 快速梯度符号法 | fast gradient sign method (FGSM) | 单步对抗攻击 |
+| 投影梯度下降 | projected gradient descent (PGD) | 迭代对抗攻击 |
+| 校准 | calibration | 置信度与正确率一致 |
+| 期望校准误差 | expected calibration error (ECE) | 校准误差的常用度量 |
+| 分布外检测 | out-of-distribution (OOD) detection | 识别训练分布外的输入 |
+| 能量分数 | energy score | 一种 OOD 评分 |
+| 量化 | quantization | 降低数值精度以加速 |
+| 剪枝 | pruning | 移除冗余参数/通道 |
+| 延迟 | latency | 单次请求耗时 |
+| 吞吐 | throughput | 单位时间处理量 |
+| 服务化 | model serving | 将模型部署为服务 |
+| 灰度发布 | canary release | 先小流量验证新版本 |
+| 监控 | monitoring | 线上指标与数据分布观测 |
+| 漂移 | drift | 数据/模型/概念随时间变化 |
+| 回归测试 | regression test | 防止旧功能被新改动破坏 |
+| 影子模式 | shadow mode | 新模型并行运行但不决策 |
+
+## D.9 研究方法
+
+| 中文 | English | 说明 |
+|---|---|---|
+| 基线 | baseline | 对照方法 |
+| 消融 | ablation | 删除/替换组件验证作用 |
+| 主效应 | main effect | 一个因子的平均影响 |
+| 交互效应 | interaction effect | 因子组合的非加性影响 |
+| 种子 | seed | 控制随机性的整数 |
+| 置信区间 | confidence interval (CI) | 参数估计的不确定性范围 |
+| p 值 | p-value | 零假设下观察到当前数据的概率 |
+| 统计显著 | statistical significance | 通常指 $p<\alpha$，不等于有效 |
+| 效应量 | effect size | 差异的实际大小 |
+| 多重比较 | multiple comparisons | 同时检验多个假设 |
+| 赢家诅咒 | winner's curse | 选择最大值导致乐观偏差 |
+| 可重复 | reproducible | 同代码/数据/环境得到相同结果 |
+| 可复现 | replicable | 新实现/新数据得到相同结论 |
+| 预注册 | preregistration | 实验前固定假设与分析方案 |
+| 负结果 | negative result | 未观察到预期效应的结果 |
+| 研究 artifact | research artifact | 代码、配置、数据、日志等交付物 |
+| 同行评审 | peer review | 同行评议论文 |
+
+## D.10 易混淆概念
+
+| 概念对 | 区别 |
+|---|---|
+| 准确率 vs 精确率 | 准确率是全部样本中答对的比例；精确率是“预测为正”中真正为正的比例 |
+| 精确率 vs 召回率 | 精确率关心误检，召回率关心漏检；F1 是两者调和平均 |
+| AP vs AUC | AP 是 PR 曲线下面积；AUC 通常指 ROC 曲线下面积，二者不同 |
+| mAP vs mIoU | mAP 用于检测/分割的实例匹配；mIoU 用于像素级语义分割 |
+| 语义 vs 实例 vs 全景分割 | 语义不区分个体；实例区分个体；全景两者都做 |
+| anchor vs proposal | anchor 是预置参考框；proposal 是网络生成的候选框 |
+| 量化 vs 蒸馏 | 量化降低数值精度；蒸馏用教师模型传递知识 |
+| 校准 vs 准确率 | 校准关心置信度是否可信；准确率关心答对多少 |
+| 可重复 vs 可复现 | 前者是同条件复跑，后者是换实现/数据仍得相同结论 |
+| NeRF vs 3DGS | NeRF 用隐式辐射场和体渲染；3DGS 用显式高斯基元光栅化 |
+| 零样本 vs 开放词汇 | 零样本强调未见类别；开放词汇强调用文本描述扩展类别空间 |
+| 参数高效微调 vs 全量微调 | 前者只训练少量新增/低秩参数，后者更新全部权重 |
+| 数据增强 vs 合成数据 | 增强变换已有样本；合成数据生成新的样本/场景 |
+| 延迟 vs 吞吐 | 延迟是单次耗时；吞吐是单位时间处理量，二者可能冲突 |

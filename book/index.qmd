@@ -34,7 +34,7 @@ toc: false
 ::: {.callout-note}
 ## 当前状态
 
-项目处于 **v0.1 骨架阶段**：全书规划、站点、工具包与 CI 已就绪，27 章正文分批写作。第 1 章为样章，其余章节先给出学习目标与内容规划。
+全书 **27 章正文与 6 个附录已完成初稿**，站点、工具包与 CI 均已就绪。当前进入全书终检：统一术语与指标口径、核对代码输出、检查站内链接，随后发布 v1.0。
 :::
 
 ## 适合谁
@@ -65,17 +65,18 @@ flowchart LR
 
 | 部分 | 章节 | 状态 |
 |---|---|---|
-| 第一部分 起步 | 第 1–2 章 | <span class="status status-writing">写作中</span> |
-| 第二部分 图像与卷积基础 | 第 3–5 章 | <span class="status status-planned">规划中</span> |
-| 第三部分 图像分类与骨干网络 | 第 6–12 章 | <span class="status status-planned">规划中</span> |
-| 第四部分 识别、定位与分割 | 第 13–18 章 | <span class="status status-planned">规划中</span> |
-| 第五部分 3D、生成与多模态 | 第 19–21 章 | <span class="status status-planned">规划中</span> |
-| 第六部分 工程落地与研究进阶 | 第 22–27 章 | <span class="status status-planned">规划中</span> |
-| 附录 A–F | 数学、环境、数据、术语、文献、调试 | <span class="status status-planned">规划中</span> |
+| 第一部分 起步 | 第 1–2 章 | <span class="status status-draft">初稿</span> |
+| 第二部分 图像与卷积基础 | 第 3–5 章 | <span class="status status-draft">初稿</span> |
+| 第三部分 图像分类与骨干网络 | 第 6–12 章 | <span class="status status-draft">初稿</span> |
+| 第四部分 识别、定位与分割 | 第 13–18 章 | <span class="status status-draft">初稿</span> |
+| 第五部分 3D、生成与多模态 | 第 19–21 章 | <span class="status status-draft">初稿</span> |
+| 第六部分 工程落地与研究进阶 | 第 22–27 章 | <span class="status status-draft">初稿</span> |
+| 附录 A–F | 数学、环境、数据、术语、文献、调试 | <span class="status status-draft">初稿</span> |
 
 ## 最近更新
 
-- **2026-10-23**：建立 27 章大纲；搭建 Quarto 站点、`d2cv` 工具包、测试与 CI；完成第 1 章样章。
+- **2026-10-23**：完成 27 章正文与附录 A–F 初稿；所有可执行代码单元通过本地构建；补充 3D 检测与研究方法的参考文献。
+- **2026-10-23**：前四批正文（第 1–24 章）完成，覆盖分类、检测、分割、3D、生成、多模态、部署与鲁棒性。
 
 ## 参与
 

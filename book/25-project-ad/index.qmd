@@ -5,37 +5,377 @@ title: "第 25 章 综合项目一：自动驾驶感知"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
 - 前置：第 13–19、23 章
-- 预计篇幅：待定
+- 预计阅读：120 分钟
+- 算力：CPU 可完成链路与坐标实验；完整基线建议单卡 12 GB
 :::
 
-## 学习目标
+前面各章分别讲了检测、跟踪、深度和部署。真实系统不会把它们分开运行：相机图像进来，检测器给出 2D 框，跟踪器维持 id，深度模型给出距离，坐标变换把结果送到车体坐标系，规划器再根据这些目标做决策。任何一环的误差都会沿链路放大。
 
-- 把 2D 检测、跟踪、深度估计串成感知链路
-- 统一相机/激光雷达/车体坐标系与标定
-- 完成精度、延迟与失败模式的系统评估
+这个项目不追求刷榜，而是把一条最小感知链路跑通，并回答三个问题：
 
-## 内容规划
+1. 每个模块的输出如何表示，坐标系如何统一？
+2. 整条链路的精度和延迟如何评估？
+3. 失败时，如何判断是检测、跟踪、深度还是同步的问题？
 
-- 数据：KITTI 样例 / nuScenes mini
-- 坐标系统一、标定与时间同步
-- 基线：YOLO + ByteTrack + 单目深度
-- BEV 概念映射与多传感器融合
-- 评测：mAP、MOTA、延迟预算、失败案例
-- 部署接口与技术报告
+我们以 KITTI/nuScenes 这一类自动驾驶数据为背景，但代码用合成数据，保证在 CPU 上可运行。真实训练脚本和评测命令单独给出。
 
-## 动手
+## 25.1 系统边界与数据流
 
-交付可复现训练脚本、评测报告、可视化 demo 与部署接口。
+一个典型的相机感知链路：
+
+```text
+图像 → 预处理 → 2D 检测 → 跟踪 → 深度/几何 → 3D 定位 → 坐标变换 → 输出
+                                      ↑
+                                 标定参数、时间戳
+```
+
+每个模块的输入输出必须有明确的契约：
+
+| 模块 | 输入 | 输出 | 关键字段 |
+|---|---|---|---|
+| 预处理 | 原始图像 | 归一化张量 | 尺寸、均值方差、时间戳 |
+| 检测 | 图像张量 | 2D 框、类别、分数 | `xyxy`、`score`、`class_id` |
+| 跟踪 | 当前帧检测 + 历史轨迹 | 带 id 的框 | `track_id`、`age`、`state` |
+| 深度 | 图像/双目/激光雷达 | 深度图或点云 | 尺度、有效范围 |
+| 3D 定位 | 2D 框 + 深度 + 内参 | 相机坐标 3D 点/框 | 单位米、坐标系 |
+| 坐标变换 | 相机坐标 + 外参 | 车体坐标 | `T_ego_cam`、时间戳 |
+
+契约不清晰时，最常见的结果是“每个模块单测都过，联调全错”。例如检测输出 `xywh`，跟踪器却按 `xyxy` 解释；深度图是归一化值，3D 定位却当成米。
+
+## 25.2 坐标系与标定
+
+自动驾驶至少涉及五个坐标系：
+
+| 坐标系 | 原点 | 轴约定 | 用途 |
+|---|---|---|---|
+| 像素 | 图像左上角 | $u$ 右、$v$ 下 | 2D 检测 |
+| 相机 | 光心 | $x$ 右、$y$ 下、$z$ 前 | 投影/反投影 |
+| 激光雷达 | 雷达中心 | $x$ 前、$y$ 左、$z$ 上 | 点云 |
+| 车体 | 后轴中心或车辆中心 | $x$ 前、$y$ 左、$z$ 上 | 规划/控制 |
+| 世界 | 地图原点 | 通常东北天 | 多帧融合 |
+
+相机到车体的变换是一个 $4 \times 4$ 齐次矩阵：
+
+$$
+\mathbf{p}_{\text{ego}} = T_{\text{ego}\leftarrow\text{cam}} \, \mathbf{p}_{\text{cam}}
+$$
+
+如果相机坐标是 $x$ 右、$y$ 下、$z$ 前，而车体是 $x$ 前、$y$ 左、$z$ 上，一个常见的换轴矩阵是：
+
+$$
+T_{\text{ego}\leftarrow\text{cam}} =
+\begin{bmatrix}
+0 & 0 & 1 & t_x \\
+-1 & 0 & 0 & t_y \\
+0 & -1 & 0 & t_z \\
+0 & 0 & 0 & 1
+\end{bmatrix}
+$$
+
+$t_x, t_y, t_z$ 是相机光心在车体坐标系下的位置。这个矩阵不是唯一的，取决于传感器安装方向和标定约定；**必须用实际标定文件验证**，不能照抄。
+
+```{python}
+#| label: ego-transform
+import torch
+
+
+def transform_points(points: torch.Tensor, T: torch.Tensor) -> torch.Tensor:
+    ones = torch.ones(len(points), 1)
+    homogeneous = torch.cat([points, ones], dim=1)
+    return (T @ homogeneous.T).T[:, :3]
+
+
+T_ego_cam = torch.tensor([
+    [0.0, 0.0, 1.0, 1.5],
+    [-1.0, 0.0, 0.0, 0.0],
+    [0.0, -1.0, 0.0, 1.2],
+    [0.0, 0.0, 0.0, 1.0],
+])
+
+points_cam = torch.tensor([
+    [0.0, 0.0, 10.0],
+    [2.0, 0.0, 10.0],
+    [0.0, 1.0, 10.0],
+])
+print("camera points:\n", points_cam)
+print("ego points:\n", transform_points(points_cam, T_ego_cam).round(decimals=2))
+```
+
+第一行点 $(0,0,10)$ 变成车体坐标 $(11.5, 0, 1.2)$：相机前方 10 米、光心高度 1.2 米。第二行点在相机右侧 2 米，变换后车体 $y=-2$。在“$y$ 向左为正”的约定下，负值表示车辆右侧，这与直觉一致。第三行点在相机下方 1 米，变换后高度 $z=0.2$ 米，低于光心。
+
+轴方向必须用一两个手工构造的点验证，不能只靠符号记忆。一个可靠的检查是：车辆前方的点变换后 $x>0$，车辆右侧的点 $y<0$，地面上的点 $z$ 接近 0。
+
+标定文件通常包含内参 $K$、畸变系数、相机到车体的外参。加载后要做一次重投影检查：把激光雷达点投到图像上，看是否与图像边缘对齐。这个检查能发现大部分轴方向和外参错误。
+
+## 25.3 时间同步
+
+传感器不是同时曝光的。相机、激光雷达、毫米波雷达各自有时间戳，频率也不同。融合前要解决：
+
+- **硬件同步**：用 PTP/gPPS 给传感器统一时钟；
+- **软件对齐**：按最近邻或插值找到时间最接近的帧；
+- **运动补偿**：激光雷达扫描期间车辆在运动，点云需要按 ego motion 去畸变。
+
+时间戳差 50 ms，在 60 km/h 下车辆移动约 0.83 米。对近距离目标，这足以让 3D 框偏离真实位置。跟踪器还会因为时间戳抖动误判速度。
+
+工程上统一使用一个单调时钟，并在每条数据上保留：
+
+- 传感器原始时间戳；
+- 主机接收时间戳；
+- 对齐后的参考时间戳；
+- 同步误差估计。
+
+没有这些字段，线上排查只能靠猜。
+
+## 25.4 合成数据上的最小链路
+
+下面用三帧合成数据跑通“检测框 → 跟踪 → 深度 → 车体坐标”的链路。检测器和深度都是模拟的，重点在接口与坐标变换。
+
+```{python}
+#| label: perception-chain
+import torch
+
+
+def box_iou_matrix(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    lt = torch.max(a[:, None, :2], b[None, :, :2])
+    rb = torch.min(a[:, None, 2:], b[None, :, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+    area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    return inter / (area_a[:, None] + area_b[None, :] - inter).clamp(min=1e-6)
+
+
+class IoUTracker:
+    def __init__(self, iou_threshold: float = 0.3) -> None:
+        self.iou_threshold = iou_threshold
+        self.tracks: dict[int, torch.Tensor] = {}
+        self.next_id = 1
+
+    def update(self, boxes: torch.Tensor) -> list[tuple[int, torch.Tensor]]:
+        if not self.tracks:
+            for box in boxes:
+                self.tracks[self.next_id] = box
+                self.next_id += 1
+            return list(self.tracks.items())
+
+        track_ids = list(self.tracks)
+        track_boxes = torch.stack([self.tracks[i] for i in track_ids])
+        ious = box_iou_matrix(track_boxes, boxes)
+        assigned_tracks, assigned_boxes = set(), set()
+        results = []
+        for _ in range(min(len(track_ids), len(boxes))):
+            flat = ious.clone()
+            flat[list(assigned_tracks)] = -1
+            flat[:, list(assigned_boxes)] = -1
+            value, index = flat.max(dim=1)
+            best_track = value.argmax().item()
+            best_iou = value[best_track].item()
+            if best_iou < self.iou_threshold:
+                break
+            best_box = index[best_track].item()
+            track_id = track_ids[best_track]
+            self.tracks[track_id] = boxes[best_box]
+            results.append((track_id, boxes[best_box]))
+            assigned_tracks.add(best_track)
+            assigned_boxes.add(best_box)
+
+        for idx, box in enumerate(boxes):
+            if idx not in assigned_boxes:
+                self.tracks[self.next_id] = box
+                results.append((self.next_id, box))
+                self.next_id += 1
+        return results
+
+
+K = torch.tensor([[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]])
+T_ego_cam = torch.tensor([
+    [0.0, 0.0, 1.0, 1.5],
+    [-1.0, 0.0, 0.0, 0.0],
+    [0.0, -1.0, 0.0, 1.2],
+    [0.0, 0.0, 0.0, 1.0],
+])
+depth_value = 20.0
+
+frames = [
+    torch.tensor([[100.0, 100.0, 150.0, 200.0], [300.0, 120.0, 420.0, 220.0]]),
+    torch.tensor([[108.0, 100.0, 158.0, 200.0], [312.0, 120.0, 432.0, 220.0]]),
+    torch.tensor([[116.0, 100.0, 166.0, 200.0], [324.0, 120.0, 444.0, 220.0]]),
+]
+
+tracker = IoUTracker()
+for frame_idx, boxes in enumerate(frames):
+    tracks = tracker.update(boxes)
+    print(f"frame {frame_idx}")
+    for track_id, box in tracks:
+        u = (box[0] + box[2]) / 2
+        v = (box[1] + box[3]) / 2
+        x_cam = (u - K[0, 2]) * depth_value / K[0, 0]
+        y_cam = (v - K[1, 2]) * depth_value / K[1, 1]
+        point = torch.tensor([[x_cam, y_cam, depth_value]])
+        ego = transform_points(point, T_ego_cam)[0]
+        print(f"  id={track_id} class={'ped' if box[2] - box[0] < 80 else 'car'} "
+              f"ego=({ego[0]:.1f}, {ego[1]:.1f}, {ego[2]:.1f})")
+```
+
+三帧中两个目标的 id 保持稳定，第三帧新增的 id 是误检或新目标；真实系统用轨迹年龄和分数过滤。深度固定为 20 米，是为了让输出可读；真实链路必须用深度模型或激光雷达。
+
+速度估计的简单做法是差分：
+
+$$
+v_x = \frac{x_t - x_{t-1}}{\Delta t}, \quad v_y = \frac{y_t - y_{t-1}}{\Delta t}
+$$
+
+差分对噪声非常敏感，通常要用卡尔曼滤波或多帧拟合。注意坐标系：车体速度与图像像素位移不是线性关系，必须先把像素变换到车体坐标再差分。
+
+## 25.5 基线方案
+
+一个可复现的基线组合：
+
+| 模块 | 基线 | 说明 |
+|---|---|---|
+| 2D 检测 | YOLOv8/YOLO11（ultralytics） | 预训练权重，在目标域微调 |
+| 跟踪 | ByteTrack | 高分/低分两阶段关联 |
+| 深度 | 单目深度模型（Depth Anything）或双目 | 必须做尺度校准 |
+| 3D 定位 | 2D 框中心 + 深度 + 内参 | 假设目标在框中心，误差较大 |
+| 坐标变换 | 标定外参 | 统一到车体/世界坐标 |
+| 评估 | mAP、MOTA、深度误差、端到端延迟 | 分开报告，避免混淆 |
+
+2D 框中心反投影假设目标位于框中心，这对行人尚可，对长车会偏差很大。更好的做法是预测 3D 框或使用地面平面约束：假设目标底部落在道路平面上，用相机高度和俯仰角反推距离。地面平面假设在坡道和颠簸路面会失效。
+
+```{python}
+#| label: ultralytics-baseline
+#| eval: false
+from ultralytics import YOLO
+
+model = YOLO("yolo11n.pt")
+results = model.track(
+    source="video.mp4",
+    tracker="bytetrack.yaml",
+    conf=0.3,
+    iou=0.5,
+    persist=True,
+    stream=True,
+)
+for result in results:
+    if result.boxes.id is not None:
+        print(result.boxes.id.tolist(), result.boxes.xyxy.tolist())
+```
+
+`model.track` 内部已经串起检测和跟踪，但工程上更常见的是分开部署：检测服务输出框，跟踪模块独立运行，便于替换和压测。
+
+## 25.6 评测协议
+
+整条链路要分层评测，不能只看一个端到端数字：
+
+| 层级 | 指标 | 数据 |
+|---|---|---|
+| 2D 检测 | mAP@0.5、AP_small、每类 AP | 目标域验证集 |
+| 跟踪 | MOTA、IDF1、ID switch | 视频序列 |
+| 深度 | AbsRel、RMSE、$\delta<1.25$ | 有深度真值的帧 |
+| 3D 定位 | 3D IoU、中心误差、朝向误差 | 标定后的 3D 框 |
+| 系统 | p50/p95/p99 延迟、吞吐、显存 | 目标硬件 |
+
+评测时必须固定：
+
+- 输入分辨率与预处理；
+- 检测分数阈值与 NMS 阈值；
+- 跟踪器的生命周期参数；
+- 深度尺度对齐方式；
+- 是否使用测试时增强。
+
+只报端到端“准确率”无法定位问题。分层指标能告诉你：检测召回掉了，还是跟踪关联错了，还是深度尺度漂移了。
+
+## 25.7 失败案例归类
+
+建议给每个失败样本打一个主标签：
+
+| 标签 | 典型原因 | 验证方法 |
+|---|---|---|
+| 检测漏检 | 小目标、遮挡、夜间 | 看检测召回与 GT 分布 |
+| 检测误检 | 背景纹理、反光 | 看 FP 的图像区域 |
+| ID switch | 遮挡、交叉、低分框 | 看轨迹与检测匹配 |
+| 深度错误 | 尺度、反光、远距离 | 与激光雷达对拍 |
+| 3D 偏移 | 外参、时间同步、地面假设 | 重投影检查 |
+| 延迟超时 | 预处理、后处理、批处理 | 分段计时 |
+
+每周统计一次失败标签分布，比只看 mAP 更能指导下一步工作。如果 60% 的失败是“3D 偏移”，继续优化检测器就是南辕北辙。
+
+## 25.8 部署接口
+
+感知服务的输出建议使用结构化 JSON，包含版本和坐标系：
+
+```json
+{
+  "frame_id": 1024,
+  "timestamp": 1720000000.123,
+  "coordinate_frame": "ego",
+  "model_version": "det-v3.2",
+  "objects": [
+    {
+      "track_id": 17,
+      "class": "pedestrian",
+      "score": 0.91,
+      "box_2d": [100.0, 120.0, 150.0, 220.0],
+      "center_3d": [12.4, -2.1, 0.8],
+      "velocity": [1.2, 0.0],
+      "state": "confirmed"
+    }
+  ],
+  "latency_ms": {"preprocess": 3.1, "detect": 18.4, "track": 1.2, "total": 24.7}
+}
+```
+
+字段命名要固定，单位要写清。下游规划器不应该猜 `center_3d` 是相机坐标还是车体坐标。版本字段用于回滚和问题定位。
+
+## 25.9 项目交付清单
+
+一个可展示的感知项目至少包含：
+
+- 数据下载/预处理脚本，带校验和与许可说明；
+- 训练配置、随机种子、硬件与依赖版本；
+- 检测、跟踪、深度的分层评测报告；
+- 失败案例可视化，按标签分类；
+- 端到端 demo（视频或 Web 界面）；
+- 部署接口与压测结果；
+- 技术报告：方法、实验、误差分析、局限。
+
+不要只交一个 notebook。可复现的脚本、固定的数据划分和清楚的评测口径，比多刷两个点更有价值。
+
+## 25.10 工程坑
+
+::: {.callout-warning}
+## 感知链路的常见问题
+
+- **各模块坐标系不一致**：检测用像素、跟踪用图像、3D 用相机，最后直接拼接。
+- **时间戳不对齐**：相机和激光雷达差几十毫秒，3D 框在运动目标上偏移。
+- **深度尺度未校准**：相对深度直接当米，近处勉强可用，远处完全错误。
+- **跟踪器跨类关联**：行人和车辆共享轨迹池，拥挤场景 ID 互换。
+- **只测模型前向**：预处理和后处理占了一半延迟，线上超时。
+- **失败样本没有标签**：知道效果差，但不知道差在哪一环。
+:::
+
+## 25.11 小结
+
+- 感知链路的核心是接口契约和坐标系，不是某个单模型的指标。
+- 相机、激光雷达、车体和世界坐标之间必须显式变换，并用重投影检查验证。
+- 时间同步和运动补偿对运动目标尤其重要。
+- 评测要分层：检测、跟踪、深度、3D 定位、系统延迟分别报告。
+- 失败案例按模块归类，才能把优化精力放在正确的位置。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+1. 用 25.4 的链路，给两个目标加入不同的深度值，比较 3D 位置和速度估计。
+2. 把 `T_ego_cam` 的 $y$ 轴符号取反，观察输出变化，并解释哪个符合你的坐标系定义。
+3. 给跟踪器加入“连续 3 帧未匹配才删除”的逻辑，观察 ID switch。
+4. 设计一个时间同步误差实验：给激光雷达加 50 ms 延迟，测量 3D 框偏移。
+5. 写一份感知项目技术报告提纲，覆盖数据、方法、指标、失败分析和局限。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- Geiger et al., *Are We Ready for Autonomous Driving? The KITTI Vision Benchmark Suite*, 2012. [@geiger2012kitti]
+- Caesar et al., *nuScenes: A Multimodal Dataset for Autonomous Driving*, 2020. [@caesar2020nuscenes]
+- Zhang et al., *ByteTrack: Multi-Object Tracking by Associating Every Detection Box*, 2022. [@zhang2022bytetrack]
+- Lang et al., *PointPillars: Fast Encoders for Object Detection from Point Clouds*, 2019. [@lang2019pointpillars]
