@@ -1,0 +1,40 @@
+---
+title: "第 18 章 视频理解与多目标跟踪"
+---
+
+::: {.callout-note}
+## 本章状态
+
+- 状态：<span class="status status-planned">规划中</span>
+- 最后更新：2026-10-23
+- 前置：第 14 章
+- 预计篇幅：待定
+:::
+
+## 学习目标
+
+- 理解视频时序建模的主要路线
+- 掌握 SORT/DeepSORT/ByteTrack 的跟踪逻辑
+- 能评估 MOTA/IDF1 与 ID switch
+
+## 内容规划
+
+- 3D CNN、Two-Stream、Video Transformer
+- 光流与时序特征
+- 检测式跟踪：SORT、DeepSORT、ByteTrack
+- MOT 指标与评测
+- 跟踪失败模式
+
+## 动手
+
+完成短视频动作识别与多目标跟踪 demo，分析 ID switch 和遮挡。
+
+## 练习
+
+1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
+2. 修改一个关键设计或超参数，解释指标变化。
+3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+
+## 延伸阅读
+
+- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。

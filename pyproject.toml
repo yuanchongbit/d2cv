@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "d2cv"
+version = "0.1.0"
+description = "Dive into Computer Vision: shared utilities for the D2CV book"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT-0" }
+authors = [
+  { name = "yuanchongbit", email = "39210932+yuanchongbit@users.noreply.github.com" }
+]
+dependencies = [
+  "numpy>=1.26",
+  "matplotlib>=3.8",
+  "pillow>=10.2",
+  "torch>=2.3",
+  "torchvision>=0.18",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2",
+  "ruff>=0.6",
+  "ipykernel>=6.29",
+  "jupyterlab>=4.2",
+]
+book = [
+  "jupyter>=1.0",
+  "ipykernel>=6.29",
+]
+det = [
+  "ultralytics>=8.3",
+  "albumentations>=1.4",
+  "opencv-python-headless>=4.10",
+]
+cv3d = [
+  "open3d>=0.18",
+  "opencv-python-headless>=4.10",
+]
+gen = [
+  "diffusers>=0.30",
+  "transformers>=4.44",
+  "accelerate>=0.33",
+  "safetensors>=0.4",
+]
+vlm = [
+  "transformers>=4.44",
+  "accelerate>=0.33",
+  "sentencepiece>=0.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

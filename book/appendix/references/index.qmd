@@ -1,0 +1,10 @@
+---
+title: "附录 E：参考文献"
+bibliography: ../../references.bib
+nocite: "@*"
+---
+
+本页汇总全书引用的论文、数据集与技术报告。正文使用 `@key` 引用，条目统一维护在 `book/references.bib`。
+
+::: {#refs}
+:::

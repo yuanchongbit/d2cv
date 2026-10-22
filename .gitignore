@@ -1,0 +1,33 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Quarto
+book/_site/
+book/.quarto/
+.quarto/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data and large artifacts
+data/
+experiments/**/outputs/
+*.onnx
+*.engine
+*.pt
+*.pth
+*.safetensors
+
+# Local env
+.env
+.env.*

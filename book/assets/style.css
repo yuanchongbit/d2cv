@@ -1,0 +1,101 @@
+:root {
+  --d2cv-ink: #111827;
+  --d2cv-muted: #6b7280;
+  --d2cv-accent: #2563eb;
+  --d2cv-border: #e5e7eb;
+}
+
+body {
+  font-family: "PingFang SC", "Noto Sans CJK SC", "Source Han Sans SC",
+    "Microsoft YaHei", -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+/* 首页 H1 只用于把 index 标记为不编号章节，可见标题由标题块提供。 */
+h1.book-index-title {
+  display: none;
+}
+
+.hero {
+  padding: 2.25rem 0 1.75rem;
+  border-bottom: 1px solid var(--d2cv-border);
+  margin-bottom: 2rem;
+}
+
+.hero h1 {
+  font-size: 2.6rem;
+  line-height: 1.15;
+  margin-bottom: 0.4rem;
+  color: var(--d2cv-ink);
+}
+
+.hero .subtitle {
+  font-size: 1.15rem;
+  color: var(--d2cv-muted);
+  margin-bottom: 1rem;
+}
+
+.hero .badges img {
+  margin: 0 0.35rem 0.35rem 0;
+}
+
+.hero .actions {
+  margin-top: 1rem;
+}
+
+.hero .actions a {
+  display: inline-block;
+  margin-right: 0.6rem;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--d2cv-border);
+  border-radius: 0.5rem;
+  text-decoration: none;
+  color: var(--d2cv-ink);
+  font-weight: 600;
+}
+
+.hero .actions a.primary {
+  background: var(--d2cv-accent);
+  border-color: var(--d2cv-accent);
+  color: white;
+}
+
+.status {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  border-radius: 0.35rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.status-done {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.status-writing {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.status-planned {
+  background: #e5e7eb;
+  color: #374151;
+}
+
+.chapter-meta {
+  font-size: 0.9rem;
+  color: var(--d2cv-muted);
+}
+
+.callout-note {
+  border-left-width: 4px;
+}
+
+code {
+  font-size: 0.9em;
+}
+
+.table td,
+.table th {
+  vertical-align: middle;
+}

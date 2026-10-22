@@ -1,0 +1,70 @@
+---
+title: "附录 B：环境与依赖"
+---
+
+::: {.callout-note}
+## 本章状态
+
+- 状态：<span class="status status-writing">写作中</span>
+- 最后更新：2026-10-23
+:::
+
+## 推荐环境
+
+| 组件 | 版本 | 说明 |
+|---|---|---|
+| Python | 3.12 | 最低 3.11 |
+| PyTorch | 2.x | 按 CUDA/MPS/CPU 选择官方安装命令 |
+| torchvision | 与 PyTorch 匹配 | 预训练权重与数据增强 |
+| Quarto | 1.6+ | 书站构建 |
+| uv | 最新稳定版 | Python 环境与依赖管理 |
+
+## 安装
+
+```bash
+uv sync --extra dev
+source .venv/bin/activate
+```
+
+如果需要特定 CUDA 版本，先按 [PyTorch 官方安装页](https://pytorch.org/get-started/locally/) 安装 `torch` 和 `torchvision`，再执行 `uv sync`。
+
+## 验证
+
+```bash
+python scripts/check_env.py
+pytest
+quarto render book --no-execute
+```
+
+## 常见问题
+
+### 有 GPU 但 `torch.cuda.is_available()` 为 False
+
+先确认安装的是 CUDA 版而不是 CPU 版：
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+```
+
+如果版本号里没有 `+cu`，重新安装对应 CUDA 版本的 wheel。
+
+### Apple Silicon 上 MPS 报错
+
+部分算子尚未在 MPS 上实现。遇到 `NotImplementedError` 时，把该算子或整个实验切到 CPU：
+
+```python
+device = torch.device("cpu")
+```
+
+### 显存不足
+
+优先尝试：减小 batch size、开启 AMP、使用梯度累积、冻结骨干、降低输入分辨率。不要先改模型结构。
+
+### Quarto 找不到 Jupyter 内核
+
+确认当前虚拟环境安装了 `ipykernel`，并在该环境中启动 Quarto：
+
+```bash
+source .venv/bin/activate
+quarto check
+```

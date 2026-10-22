@@ -1,0 +1,87 @@
+---
+toc: false
+---
+
+# 动手学计算机视觉 {.unnumbered .book-index-title}
+
+::: {.hero}
+<p class="subtitle">从像素到部署，把每一个概念跑起来。</p>
+
+<div class="badges">
+[![CI](https://github.com/yuanchongbit/d2cv/actions/workflows/ci.yml/badge.svg)](https://github.com/yuanchongbit/d2cv/actions/workflows/ci.yml)
+[![Deploy](https://github.com/yuanchongbit/d2cv/actions/workflows/publish.yml/badge.svg)](https://github.com/yuanchongbit/d2cv/actions/workflows/publish.yml)
+[![License: CC BY-SA 4.0](https://img.shields.io/badge/Text-CC%20BY--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-sa/4.0/)
+[![Code: MIT-0](https://img.shields.io/badge/Code-MIT--0-blue.svg)](https://github.com/yuanchongbit/d2cv/blob/main/LICENSE-CODE)
+</div>
+
+<div class="actions">
+[开始阅读](01-intro/index.qmd){.primary}
+[GitHub 仓库](https://github.com/yuanchongbit/d2cv)
+[全书大纲](https://github.com/yuanchongbit/d2cv/blob/main/OUTLINE.md)
+</div>
+:::
+
+## 这本书是什么
+
+一本面向**有深度学习基础的算法工程师**的开源计算机视觉教材。用 PyTorch 一条技术栈，从图像与卷积讲到检测、分割、3D、生成、多模态与部署。
+
+每章遵循同一套结构：
+
+> 真实问题 → 原理与公式 → 从零实现 → 调库实现 → 实验与误差分析 → 工程坑 → 练习
+
+与 [D2L](https://zh-v2.d2l.ai/) 的关系：继承其“可运行代码 + 从零实现”的教学法，但不重复深度学习基础；本书聚焦 CV 的完整链路和工程落地。
+
+::: {.callout-note}
+## 当前状态
+
+项目处于 **v0.1 骨架阶段**：全书规划、站点、工具包与 CI 已就绪，27 章正文分批写作。第 1 章为样章，其余章节先给出学习目标与内容规划。
+:::
+
+## 适合谁
+
+- 有 1–3 年深度学习经验的算法工程师。
+- 想系统补齐 CV 知识、做出可展示项目、把模型真正部署上线的人。
+- 不要求读过 D2L，但需要会 Python、PyTorch 训练循环、CNN 基础、Linux/GPU 基本操作。
+
+## 怎么读
+
+| 路径 | 章节 | 适合 |
+|---|---|---|
+| 落地优先 | 1–4、6–8、10、12–16、22–27 | 尽快把检测/分割/部署串起来 |
+| 完整通读 | 1–27 | 系统建立 CV 知识体系 |
+| 研究进阶 | 11、17–21、27 + 两个综合项目 | 做复现、消融与论文 |
+
+## 全书地图
+
+```{mermaid}
+flowchart LR
+  A["图像与卷积<br/>第 1–5 章"] --> B["分类与骨干<br/>第 6–12 章"]
+  B --> C["检测、分割、视频<br/>第 13–18 章"]
+  C --> D["3D、生成、VLM<br/>第 19–21 章"]
+  D --> E["数据、部署、项目<br/>第 22–27 章"]
+```
+
+## 写作进度
+
+| 部分 | 章节 | 状态 |
+|---|---|---|
+| 第一部分 起步 | 第 1–2 章 | <span class="status status-writing">写作中</span> |
+| 第二部分 图像与卷积基础 | 第 3–5 章 | <span class="status status-planned">规划中</span> |
+| 第三部分 图像分类与骨干网络 | 第 6–12 章 | <span class="status status-planned">规划中</span> |
+| 第四部分 识别、定位与分割 | 第 13–18 章 | <span class="status status-planned">规划中</span> |
+| 第五部分 3D、生成与多模态 | 第 19–21 章 | <span class="status status-planned">规划中</span> |
+| 第六部分 工程落地与研究进阶 | 第 22–27 章 | <span class="status status-planned">规划中</span> |
+| 附录 A–F | 数学、环境、数据、术语、文献、调试 | <span class="status status-planned">规划中</span> |
+
+## 最近更新
+
+- **2026-10-23**：建立 27 章大纲；搭建 Quarto 站点、`d2cv` 工具包、测试与 CI；完成第 1 章样章。
+
+## 参与
+
+欢迎提 Issue 和 PR。开始之前请阅读 [贡献指南](https://github.com/yuanchongbit/d2cv/blob/main/CONTRIBUTING.md)、[写作规范](https://github.com/yuanchongbit/d2cv/blob/main/STYLE_GUIDE.md) 和 [术语表](https://github.com/yuanchongbit/d2cv/blob/main/TERMINOLOGY.md)。
+
+## 许可
+
+- 正文与图片：[CC BY-SA 4.0](https://github.com/yuanchongbit/d2cv/blob/main/LICENSE)
+- 代码：[MIT-0](https://github.com/yuanchongbit/d2cv/blob/main/LICENSE-CODE)

@@ -1,0 +1,93 @@
+project:
+  type: book
+  output-dir: _site
+  resources:
+    - assets/
+
+bibliography: references.bib
+
+book:
+  title: "动手学计算机视觉"
+  subtitle: "Dive into Computer Vision"
+  author: "yuanchongbit"
+  date: "2026-10-23"
+  search: true
+  repo-url: "https://github.com/yuanchongbit/d2cv"
+  repo-actions: [edit, issue]
+  sidebar:
+    style: docked
+    search: true
+    logo: assets/logo.svg
+  favicon: assets/favicon.svg
+  page-footer:
+    left: "© 2026 yuanchongbit"
+    center: "正文 CC BY-SA 4.0 · 代码 MIT-0"
+    right: "Built with Quarto"
+  chapters:
+    - index.qmd
+    - part: "第一部分 起步"
+      chapters:
+        - 01-intro/index.qmd
+        - 02-setup/index.qmd
+    - part: "第二部分 图像与卷积基础"
+      chapters:
+        - 03-image-basics/index.qmd
+        - 04-conv/index.qmd
+        - 05-classic-features/index.qmd
+    - part: "第三部分 图像分类与骨干网络"
+      chapters:
+        - 06-linear-mlp/index.qmd
+        - 07-cnn/index.qmd
+        - 08-training/index.qmd
+        - 09-efficient/index.qmd
+        - 10-vit/index.qmd
+        - 11-ssl/index.qmd
+        - 12-transfer/index.qmd
+    - part: "第四部分 识别、定位与分割"
+      chapters:
+        - 13-detection-basics/index.qmd
+        - 14-detectors/index.qmd
+        - 15-segmentation/index.qmd
+        - 16-instance-seg/index.qmd
+        - 17-pose/index.qmd
+        - 18-video-tracking/index.qmd
+    - part: "第五部分 3D、生成与多模态"
+      chapters:
+        - 19-3d-basics/index.qmd
+        - 20-generative/index.qmd
+        - 21-vlm/index.qmd
+    - part: "第六部分 工程落地与研究进阶"
+      chapters:
+        - 22-data/index.qmd
+        - 23-deployment/index.qmd
+        - 24-robustness/index.qmd
+        - 25-project-ad/index.qmd
+        - 26-project-3d/index.qmd
+        - 27-research/index.qmd
+  appendices:
+    - appendix/math/index.qmd
+    - appendix/environment/index.qmd
+    - appendix/datasets/index.qmd
+    - appendix/glossary/index.qmd
+    - appendix/references/index.qmd
+    - appendix/debugging/index.qmd
+
+format:
+  html:
+    theme: cosmo
+    css: assets/style.css
+    toc: true
+    toc-depth: 3
+    number-sections: false
+    code-fold: true
+    code-tools: true
+    code-copy: true
+    highlight-style: github
+    lang: zh
+    link-external-newwindow: true
+
+execute:
+  freeze: auto
+  echo: true
+  warning: false
+  message: false
