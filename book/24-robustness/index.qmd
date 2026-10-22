@@ -5,36 +5,285 @@ title: "第 24 章 可解释性、鲁棒性与安全（选读）"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
 - 前置：第 8、13 章
-- 预计篇幅：待定
+- 预计阅读：80 分钟
+- 算力：CPU 可完成 Grad-CAM 与对抗样本实验；大规模鲁棒性评测建议单卡 8 GB
 :::
 
-## 学习目标
+一个分类器在测试集上达到 0.95，不代表它在雨夜、运动模糊或恶意扰动下仍然可靠。模型可能依赖背景、水印或某个偶然相关的纹理；也可能在输入加上肉眼不可见的扰动后，以极高置信度输出错误类别。
 
-- 掌握 CAM/Grad-CAM 等归因方法
-- 理解对抗样本、OOD 与置信度校准
-- 能从防御视角评估模型风险
+这一章从防御视角讨论三类问题：模型为什么这么预测（可解释性）、输入变化时是否稳定（鲁棒性）、置信度是否可信（校准与 OOD）。所有对抗实验仅用于评估与加固自己的模型，不涉及规避检测或攻击他人系统。
 
-## 内容规划
+## 24.1 可解释性：我们想知道什么
 
-- CAM、Grad-CAM、遮挡与归因
-- FGSM/PGD 对抗样本
-- OOD 检测与置信度校准
-- 数据隐私与模型窃取概览
-- 防御性评估与缓解
+“解释”至少可以指三件不同的事：
 
-## 动手
+- **归因**：输入的哪些区域/像素对当前预测贡献最大；
+- **概念**：模型内部是否学到了“条纹”“耳朵”这类人类概念；
+- **反事实**：输入怎样变化才会改变预测。
 
-从防御视角评估一个小分类器的鲁棒性，并尝试一种缓解方法。
+CAM/Grad-CAM 属于归因方法。它们生成一张与输入同尺寸的热图，颜色越深表示该区域对目标类别越重要。热图好看不等于解释正确：模型可能只是把注意力放在相关但非因果的区域。
+
+## 24.2 CAM 与 Grad-CAM
+
+CAM 要求网络在全局平均池化后接线性分类器。设最后一层卷积特征为 $A^k$，类别 $c$ 的线性权重为 $w_k^c$，则：
+
+$$
+L_{\mathrm{CAM}}^c = \mathrm{ReLU}\left(\sum_k w_k^c A^k\right)
+$$
+
+ReLU 只保留对类别有正贡献的区域。问题是不是所有网络都有这个结构；Grad-CAM 用梯度代替分类权重：
+
+$$
+\alpha_k^c = \frac{1}{Z}\sum_{i,j} \frac{\partial y^c}{\partial A_{ij}^k},
+\quad
+L_{\mathrm{Grad-CAM}}^c = \mathrm{ReLU}\left(\sum_k \alpha_k^c A^k\right)
+$$
+
+$\alpha_k^c$ 是第 $k$ 个特征图对类别 $c$ 的全局平均梯度，$Z$ 是特征图空间位置数。下面在预训练的 ResNet-18 上实现 Grad-CAM：
+
+```{python}
+#| label: fig-gradcam
+#| fig-cap: "Grad-CAM 在 Chelsea 图像上的结果。热图集中在猫的脸部和胡须区域，但高亮区域不等于因果证据。"
+import numpy as np
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from PIL import Image
+from torchvision.models import resnet18, ResNet18_Weights
+from pathlib import Path
+
+weights = ResNet18_Weights.DEFAULT
+model = resnet18(weights=weights).eval()
+preprocess = weights.transforms()
+
+image_path = next(
+    p for p in (Path("assets/chelsea.png"), Path("../assets/chelsea.png")) if p.exists()
+)
+image = Image.open(image_path).convert("RGB")
+x = preprocess(image).unsqueeze(0)
+
+activations, gradients = [], []
+model.layer4.register_forward_hook(lambda m, i, o: activations.append(o))
+model.layer4.register_full_backward_hook(lambda m, gi, go: gradients.append(go[0]))
+
+logits = model(x)
+class_id = logits.argmax(1).item()
+logits[0, class_id].backward()
+
+acts, grads = activations[0], gradients[0]
+channel_weights = grads.mean(dim=(2, 3), keepdim=True)
+cam = F.relu((channel_weights * acts).sum(dim=1, keepdim=True))
+cam = F.interpolate(cam, size=x.shape[-2:], mode="bilinear", align_corners=False)[0, 0]
+cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+
+print("predicted class:", class_id)
+print("confidence:", round(logits.softmax(1)[0, class_id].item(), 3))
+print("CAM peak:", divmod(cam.argmax().item(), cam.shape[1]))
+
+image_np = np.asarray(image.resize((224, 224)))
+fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+axes[0].imshow(image_np)
+axes[0].set_title("input")
+axes[0].axis("off")
+axes[1].imshow(image_np)
+axes[1].imshow(cam.detach().numpy(), cmap="jet", alpha=0.45)
+axes[1].set_title(f"Grad-CAM, class {class_id}")
+axes[1].axis("off")
+fig.tight_layout()
+```
+
+结果中热图落在猫的脸部，这与直觉一致。但要注意：
+
+- Grad-CAM 的分辨率受最后一层特征图限制，小目标可能被平滑掉；
+- 梯度饱和时，热图可能几乎全黑或全亮；
+- 多个类别可能高亮同一区域，方法本身不保证类别特异性；
+- 热图是相关性，不是因果性。要做因果归因，需要遮挡、消融或反事实实验。
+
+## 24.3 遮挡与归因的陷阱
+
+遮挡敏感度是最朴素的归因：把图像的一小块区域替换成灰色/噪声，看目标类别概率下降多少。它不依赖梯度，模型无关，但计算量大，且遮挡块大小会改变结论。
+
+归因方法有几个共同陷阱：
+
+- **确认偏误**：先相信模型是对的，再把热图解释成“合理”；
+- **只展示成功样本**：失败样本的热图往往更有信息量；
+- **把显著性当因果**：高亮区域可能是模型利用的伪相关（水印、医院标记、拍摄设备）；
+- **跨模型比较**：不同架构、不同层的热图不能直接比较。
+
+在医疗、工业质检等高风险场景，归因只能作为排查线索，不能作为合规证据。
+
+## 24.4 对抗样本：FGSM 与 PGD
+
+对抗样本是在输入上加一个小扰动，使模型预测改变。扰动通常受 $L_\infty$ 范数约束：$\|\delta\|_\infty \leq \epsilon$，$\epsilon$ 常取 $2/255$ 到 $8/255$。
+
+FGSM（fast gradient sign method）沿损失对输入的梯度方向走一步：
+
+$$
+x_{\mathrm{adv}} = x + \epsilon \cdot \mathrm{sign}\left(\nabla_x \mathcal{L}(f(x), y)\right)
+$$
+
+PGD（projected gradient descent）迭代多步，并把结果投影回 $\epsilon$ 球：
+
+$$
+x^{t+1} = \Pi_{\|\delta\|_\infty \leq \epsilon}
+\left(x^t + \alpha \cdot \mathrm{sign}(\nabla_x \mathcal{L})\right)
+$$
+
+```{python}
+#| label: adversarial
+#| warning: false
+import torch
+import torch.nn.functional as F
+
+epsilon = 4 / 255
+x_clean = x.clone().detach()
+
+x_fgsm = x_clean.clone().detach().requires_grad_(True)
+loss = F.cross_entropy(model(x_fgsm), torch.tensor([class_id]))
+loss.backward()
+x_fgsm = (x_fgsm + epsilon * x_fgsm.grad.sign()).clamp(x_clean.min(), x_clean.max()).detach()
+
+x_pgd = x_clean.clone().detach()
+for _ in range(10):
+    x_pgd.requires_grad_(True)
+    loss = F.cross_entropy(model(x_pgd), torch.tensor([class_id]))
+    grad = torch.autograd.grad(loss, x_pgd)[0]
+    x_pgd = (x_pgd + (epsilon / 4) * grad.sign()).clamp(
+        x_clean - epsilon, x_clean + epsilon
+    ).clamp(x_clean.min(), x_clean.max()).detach()
+
+with torch.no_grad():
+    for name, adv in [("clean", x_clean), ("FGSM", x_fgsm), ("PGD", x_pgd)]:
+        probs = model(adv).softmax(1)
+        print(f"{name:5s} pred={probs.argmax(1).item():3d} "
+              f"p(true)={probs[0, class_id].item():.4f}")
+```
+
+在预训练 ResNet-18 上，$\epsilon=4/255$ 的 FGSM 就能把预测从 Egyptian cat 改成一个相邻类别，PGD 进一步把真实类别概率压到接近 0。这不是模型“看错了”，而是它的决策边界在输入空间中离样本很近。
+
+对抗训练的防御思路是在训练时加入对抗样本：
+
+$$
+\min_\theta \mathbb{E}_{(x,y)} \max_{\|\delta\|_\infty \leq \epsilon}
+\mathcal{L}(f_\theta(x + \delta), y)
+$$
+
+它能提升鲁棒性，但通常代价是干净样本精度下降、训练成本上升。其他防御（输入变换、检测异常、梯度掩码）大多只能提高攻击成本，不能提供严格保证。
+
+## 24.5 置信度校准
+
+一个模型说“置信度 0.9”，理想情况下这类样本应该有约 90% 是正确的。很多现代网络过于自信：置信度 0.99 的样本可能只有 0.8 的准确率。
+
+期望校准误差（expected calibration error, ECE）把预测按置信度分桶：
+
+$$
+\mathrm{ECE} = \sum_{m=1}^{M} \frac{|B_m|}{n}
+\left| \mathrm{acc}(B_m) - \mathrm{conf}(B_m) \right|
+$$
+
+```{python}
+#| label: ece
+def expected_calibration_error(probs: torch.Tensor, labels: torch.Tensor,
+                               bins: int = 10) -> float:
+    confidences, predictions = probs.max(dim=1)
+    accuracies = predictions.eq(labels).float()
+    boundaries = torch.linspace(0, 1, bins + 1)
+    ece = 0.0
+    for lower, upper in zip(boundaries[:-1], boundaries[1:]):
+        in_bin = (confidences > lower) & (confidences <= upper)
+        if in_bin.any():
+            bin_acc = accuracies[in_bin].mean().item()
+            bin_conf = confidences[in_bin].mean().item()
+            ece += in_bin.float().mean().item() * abs(bin_acc - bin_conf)
+    return ece
+
+
+torch.manual_seed(0)
+probs = torch.rand(200, 5).pow(0.5)
+probs = probs / probs.sum(dim=1, keepdim=True)
+labels = torch.randint(0, 5, (200,))
+print("ECE:", round(expected_calibration_error(probs, labels), 4))
+```
+
+温度缩放（temperature scaling）是最简单的校准方法：在验证集上学习一个温度 $T$，推理时用 $\mathrm{softmax}(z/T)$。它不改变 argmax，只改变置信度，因此不会影响分类准确率。
+
+校准必须在与部署分布一致的验证集上做。训练集上的校准参数不能直接迁移到夜间、雨天或新设备数据。
+
+## 24.6 OOD 检测
+
+分布外（out-of-distribution, OOD）样本是模型训练时没见过的类型。OOD 检测试图在推理时识别“这张图不属于我的训练分布”，从而拒答或转人工。
+
+常见信号：
+
+- **最大 softmax 概率**：OOD 样本通常置信度较低，但过度自信的网络会失效；
+- **能量分数**：$E(x) = -T \log \sum_c \exp(z_c / T)$，比 softmax 更稳定；
+- **特征距离**：与训练集特征中心的马氏距离或 kNN 距离；
+- **集成不一致性**：多个模型/增强视图的预测分歧。
+
+```{python}
+#| label: ood-score
+def energy_score(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    return -temperature * torch.logsumexp(logits / temperature, dim=1)
+
+
+in_distribution = torch.randn(100, 10) * 2
+shifted = torch.randn(100, 10) * 0.25
+print("in-distribution energy:", energy_score(in_distribution).mean().item())
+print("shifted energy:        ", energy_score(shifted).mean().item())
+```
+
+能量越低表示模型越“确信”。分布偏移样本的 logits 通常更平，能量更高。实际阈值要在验证集上按目标误拒率确定，并分别报告 ID 准确率、OOD 检出率和误报率。
+
+OOD 不等于对抗样本：前者是自然分布偏移，后者是刻意优化出的扰动。防御手段也不同。
+
+## 24.7 隐私与模型窃取
+
+部署的模型可能泄露训练数据信息，也可能被复制：
+
+- **成员推断**：判断某个样本是否在训练集中；
+- **记忆提取**：生成模型复现训练图像；
+- **模型窃取**：通过大量查询拟合替代模型；
+- **数据泄漏**：日志、缓存或错误信息暴露原始图像。
+
+防御包括：最小化训练数据中的敏感信息、差分隐私训练、限制查询频率、输出置信度粗化、水印与指纹。没有一种措施能单独解决问题，高风险场景需要结合访问控制、审计和法律手段。
+
+本章不讨论如何实施上述攻击，只强调评估时应把隐私和滥用风险纳入上线 checklist。
+
+## 24.8 工程坑
+
+::: {.callout-warning}
+## 鲁棒性评估的常见误区
+
+- **只在干净测试集上评估**：雨、雾、模糊、压缩、低光照都没有覆盖。
+- **用热图证明模型正确**：热图是相关性，不是因果性。
+- **对抗样本只测一个 $\epsilon$**：不同扰动预算下的结论可能相反。
+- **校准集与部署分布不一致**：温度参数在新域上失效。
+- **OOD 阈值用测试集调**：等于在测试集上过拟合。
+- **忽略误报成本**：OOD 拒识率提高，正常请求也被拒，业务指标下降。
+:::
+
+## 24.9 小结
+
+- Grad-CAM 用梯度加权的特征图做归因，能提供线索但不能证明因果。
+- 对抗样本利用决策边界附近的脆弱性；FGSM 一步、PGD 多步，$\epsilon$ 决定扰动预算。
+- 对抗训练能提升鲁棒性，但会牺牲干净精度并增加训练成本。
+- 置信度需要校准，ECE 和温度缩放是基础工具；校准必须匹配部署分布。
+- OOD 检测、隐私保护和模型防窃取是上线评估的一部分，不是可选项。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+1. 在 Grad-CAM 中改用不同层（layer3/layer4），比较热图分辨率与定位。
+2. 用遮挡敏感度验证 Grad-CAM 的高亮区域，分析两者是否一致。
+3. 在 $\epsilon=1/255, 2/255, 4/255, 8/255$ 下评估 FGSM 成功率，画出曲线。
+4. 用温度缩放校准一个分类器，比较校准前后的 ECE 和准确率。
+5. 设计一个 OOD 评测协议，说明 ID/OOD 数据划分、阈值选择和报告指标。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- Selvaraju et al., *Grad-CAM: Visual Explanations from Deep Networks via Gradient-Based Localization*, 2017. [@selvaraju2017gradcam]
+- Goodfellow et al., *Explaining and Harnessing Adversarial Examples*, 2015. [@goodfellow2014fgsm]
+- Madry et al., *Towards Deep Learning Models Resistant to Adversarial Attacks*, 2018. [@madry2018pgd]
+- Guo et al., *On Calibration of Modern Neural Networks*, 2017.

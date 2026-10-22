@@ -5,36 +5,285 @@ title: "第 23 章 模型压缩与推理部署"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
 - 前置：第 8、13 章
-- 预计篇幅：待定
+- 预计阅读：80 分钟
+- 算力：CPU 可完成导出、量化与延迟实验；TensorRT/服务化需要 GPU 或 Docker 环境
 :::
 
-## 学习目标
+训练脚本里的一次 `model(x)` 和线上服务里的一次推理，中间隔着很长一段路：导出、算子融合、量化、批处理、前后处理对齐、监控。很多模型在 notebook 里指标很好，上线后却出现延迟超标、结果漂移、偶发崩溃。
 
-- 掌握 ONNX 导出、量化与推理引擎
-- 理解前后处理对齐与精度回归
-- 能把模型部署成可压测的服务
+部署的核心不是“把模型跑起来”，而是把**输入、预处理、模型、后处理、输出**作为一个整体来验证。这一章从导出讲到服务化，重点放在容易出错的对齐问题上。
 
-## 内容规划
+## 23.1 部署链路
 
-- ONNX 导出与算子兼容
-- TensorRT/OpenVINO、FP16/INT8 量化
-- 批处理、异步与延迟预算
-- 服务化：FastAPI/Triton
-- 精度回归与线上监控
+| 阶段 | 产物 | 关键检查 |
+|---|---|---|
+| 导出 | ONNX / TorchScript / engine | 输出与 PyTorch 一致 |
+| 优化 | FP16 / INT8 / 算子融合 | 精度回归在容差内 |
+| 服务 | HTTP/gRPC 接口 | 延迟、并发、超时 |
+| 监控 | 指标与日志 | 漂移、错误率、p99 延迟 |
 
-## 动手
+每一阶段都要保留“回到上一阶段”的能力。量化后精度掉了，要能快速回到 FP16；服务化后延迟不达标，要能定位是预处理、模型还是后处理。
 
-把检测或分割模型部署成 HTTP 服务，完成压测、前后处理对齐与精度回归。
+## 23.2 导出：先保证数值一致
+
+ONNX 是最常见的中间格式。导出时要明确：
+
+- opset 版本，太低不支持新算子，太高可能不被推理引擎支持；
+- 输入输出的名称和形状；
+- 是否使用动态 batch、动态分辨率；
+- 模型是否在 eval 模式，是否有 dropout/BN 差异。
+
+```{python}
+#| label: onnx-export
+#| eval: false
+import torch
+from torch import nn
+
+model = nn.Sequential(nn.Conv2d(3, 16, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(1),
+                      nn.Flatten(), nn.Linear(16, 10)).eval()
+dummy = torch.randn(1, 3, 224, 224)
+
+torch.onnx.export(
+    model,
+    dummy,
+    "model.onnx",
+    input_names=["image"],
+    output_names=["logits"],
+    dynamic_axes={"image": {0: "batch"}, "logits": {0: "batch"}},
+    opset_version=17,
+)
+
+import onnxruntime as ort
+session = ort.InferenceSession("model.onnx", providers=["CPUExecutionProvider"])
+with torch.no_grad():
+    expected = model(dummy).numpy()
+actual = session.run(None, {"image": dummy.numpy()})[0]
+print("max abs diff:", abs(expected - actual).max())
+```
+
+导出后第一件事不是测速度，而是对拍数值。至少用 10 组真实输入比较 PyTorch 与推理引擎的输出；分类看 argmax 是否一致，检测看框和分数的最大偏差，分割看 mIoU 变化。
+
+常见导出失败：
+
+- 自定义算子没有 ONNX 实现；
+- 动态控制流（if/loop 依赖张量值）无法静态导出；
+- 后处理写在模型里，包含 NMS 等引擎不支持的算子；
+- 输入尺寸写死，部署时换分辨率就报错。
+
+工程上通常把后处理移出模型图，用 C++/Python 单独实现，并对拍前后处理结果。
+
+## 23.3 量化：从 FP32 到 INT8
+
+量化把浮点权重和激活映射到低比特整数。对称量化的基本公式：
+
+$$
+q = \mathrm{clip}\left(\mathrm{round}\left(\frac{x}{s}\right), -2^{b-1}, 2^{b-1}-1\right),
+\quad \hat{x} = s q
+$$
+
+$s$ 是缩放因子，$b$ 是位宽。权重可以用逐通道缩放，激活通常用逐张量缩放。量化能否成功，取决于校准数据能否覆盖真实的激活分布。
+
+```{python}
+#| label: int8-weight
+#| warning: false
+import copy
+import time
+import warnings
+
+import torch
+from torch import nn
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+torch.manual_seed(0)
+
+model = nn.Sequential(
+    nn.Linear(256, 512), nn.ReLU(),
+    nn.Linear(512, 128), nn.ReLU(),
+    nn.Linear(128, 10),
+).eval()
+x = torch.randn(64, 256)
+
+
+def quantize_weight(weight: torch.Tensor, bits: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
+    qmax = 2 ** (bits - 1) - 1
+    scale = weight.abs().max() / qmax
+    q = (weight / scale).round().clamp(-qmax - 1, qmax).to(torch.int8)
+    return q, scale
+
+
+qmodel = copy.deepcopy(model)
+for module in qmodel:
+    if isinstance(module, nn.Linear):
+        q, scale = quantize_weight(module.weight.data)
+        module.weight.data = q.float() * scale
+
+with torch.inference_mode():
+    diff = (model(x) - qmodel(x)).abs().max().item()
+print("max output diff:", round(diff, 4))
+print("fp32 weight bytes:", model[0].weight.numel() * 4)
+print("int8 weight bytes:", model[0].weight.numel())
+
+
+def benchmark(module: nn.Module, iterations: int = 100) -> float:
+    with torch.inference_mode():
+        for _ in range(10):
+            module(x)
+        start = time.perf_counter()
+        for _ in range(iterations):
+            module(x)
+    return (time.perf_counter() - start) / iterations * 1000
+
+
+traced = torch.jit.optimize_for_inference(torch.jit.trace(model, x))
+print("eager ms:", round(benchmark(model), 3))
+print("traced ms:", round(benchmark(traced), 3))
+```
+
+这个例子只量化了权重，激活仍是浮点，所以速度提升有限，但能直观看到量化误差和存储节省。生产中的 INT8 推理需要推理引擎同时量化激活，并用校准集统计每层激活范围。
+
+量化方式：
+
+- **训练后量化（PTQ）**：用几百张校准图统计激活范围，不需要重新训练，最快；
+- **量化感知训练（QAT）**：训练时模拟量化误差，精度更高，成本也更高；
+- **动态量化**：激活在推理时动态量化，适合 NLP 的线性层，对卷积网络收益有限。
+
+量化后必须做精度回归。分类看 top-1 下降，检测看 mAP，分割看 mIoU；同时看每类指标，避免平均值掩盖某个类别的崩溃。
+
+## 23.4 延迟预算
+
+端到端延迟可以拆成：
+
+$$
+T_{\text{e2e}} = T_{\text{decode}} + T_{\text{preprocess}} + T_{\text{infer}} + T_{\text{postprocess}} + T_{\text{network}}
+$$
+
+很多团队只测 $T_{\text{infer}}$，上线后发现预处理（解码、resize、归一化）和后处理（NMS、掩码还原）占了一半以上。尤其是高分辨率图像解码和 Python 循环后处理，常常是真正的瓶颈。
+
+测量时要注意：
+
+- 用目标硬件、目标 batch、目标精度；
+- 预热足够次数，排除首次编译和缓存影响；
+- 报告 p50、p95、p99，而不是只报平均；
+- 区分吞吐（images/s）和单张延迟；
+- 把前后处理纳入同一个计时区间。
+
+批处理能提升吞吐，但会增加单张延迟。实时系统通常用动态 batching：在几毫秒窗口内聚合请求，窗口大小由延迟预算决定。
+
+## 23.5 服务化
+
+一个最小可用的推理服务需要：
+
+- 输入校验（尺寸、通道、编码格式）；
+- 预处理与训练完全一致；
+- 模型常驻显存，避免每请求加载；
+- 超时与降级策略；
+- 健康检查与指标暴露；
+- 结构化日志，记录请求 id、延迟、模型版本。
+
+```{python}
+#| label: fastapi-service
+#| eval: false
+from fastapi import FastAPI, File, UploadFile
+from PIL import Image
+import io
+import torch
+
+app = FastAPI()
+model = torch.jit.load("model.pt").eval()
+
+
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    image = Image.open(io.BytesIO(await file.read())).convert("RGB")
+    tensor = preprocess(image).unsqueeze(0)
+    with torch.inference_mode():
+        logits = model(tensor)
+    probs = logits.softmax(dim=-1)[0]
+    return {"class_id": int(probs.argmax()), "score": float(probs.max())}
+```
+
+这段代码省略了鉴权、限流、请求大小限制和错误处理，不能直接暴露到公网。生产服务还要考虑模型版本热更新、灰度发布和回滚。
+
+Triton 适合多模型、多框架、GPU 共享的场景；它支持动态 batching、模型集成和指标导出。FastAPI 更轻，适合单模型或原型。选型取决于并发量、模型数量和团队运维能力。
+
+## 23.6 精度回归与线上监控
+
+部署前建立 golden set：一组固定的真实输入和期望输出。每次导出、量化、换引擎后都跑一遍，比较：
+
+```{python}
+#| label: regression
+def check_regression(baseline: dict[str, float], current: dict[str, float],
+                     tolerance: float = 0.01) -> dict[str, float]:
+    deltas = {}
+    for key, value in baseline.items():
+        delta = current[key] - value
+        deltas[key] = delta
+        if delta < -tolerance:
+            print(f"[WARN] {key} dropped by {-delta:.4f}")
+    return deltas
+
+
+baseline = {"top1": 0.812, "macro_f1": 0.76, "p95_latency_ms": 18.0}
+current = {"top1": 0.809, "macro_f1": 0.74, "p95_latency_ms": 21.0}
+print(check_regression(baseline, current))
+```
+
+线上监控除了延迟和错误率，还要看输入与输出的分布：
+
+- 输入亮度、分辨率、长宽比分布是否漂移；
+- 预测类别分布是否突变；
+- 置信度分布是否整体下降；
+- 特定类别的召回是否下降；
+- 请求是否集中在某个设备/地区/时段。
+
+监控告警要能定位到模型版本和数据版本。没有版本信息的告警，排查成本极高。
+
+## 23.7 边缘设备
+
+边缘部署的约束与服务器不同：
+
+- 内存和显存小，模型需要裁剪或量化；
+- 算子支持不全，某些 PyTorch 算子无法转换；
+- 功耗和散热限制持续性能；
+- 更新困难，需要 OTA 和回滚机制。
+
+常见路线是 PyTorch → ONNX → TensorRT（NVIDIA）或 OpenVINO（Intel）或 TFLite/NCNN（移动端）。每条路线的算子支持不同，必须用目标设备实测，而不是只看桌面 GPU 的 benchmark。
+
+## 23.8 工程坑
+
+::: {.callout-warning}
+## 部署中的常见问题
+
+- **预处理不一致**：训练用 RGB、双线性、ImageNet 均值，服务用 BGR、最近邻、0–1 归一化。
+- **只对拍模型输出，不对拍后处理**：模型一致，NMS 或框解码实现不同，最终结果不同。
+- **动态 shape 没测**：导出时写死 224×224，线上传入其他尺寸直接报错。
+- **量化校准集有偏**：校准图全是白天，夜间激活被截断，夜间精度崩溃。
+- **p99 延迟超标**：只看平均值，尾部请求超时。
+- **服务无版本信息**：出问题无法判断是模型、数据还是代码变更。
+:::
+
+## 23.9 小结
+
+- 部署是“预处理 + 模型 + 后处理”的整体，任何一环不一致都会导致线上偏差。
+- 导出后先对拍数值，再谈优化；动态 shape 和自定义算子要提前验证。
+- 量化能降低存储和延迟，但必须用目标数据校准并做精度回归。
+- 端到端延迟要包含解码、预处理、推理和后处理，报告 p50/p95/p99。
+- 服务化需要输入校验、超时、降级、版本信息和监控，不能只包一层 HTTP。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+1. 把一个 torchvision 分类模型导出为 ONNX，比较 PyTorch 与 ONNX Runtime 的 top-1 和最大输出偏差。
+2. 实现逐通道权重量化，比较逐张量与逐通道的量化误差。
+3. 测量一个检测模型的预处理、推理、后处理耗时占比，找出瓶颈。
+4. 给 23.6 的回归检查加入每类指标和延迟指标。
+5. 设计一个模型灰度发布与回滚方案，说明需要记录哪些版本信息。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- Jacob et al., *Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference*, 2018.
+- ONNX Runtime documentation: https://onnxruntime.ai/docs/
+- NVIDIA TensorRT documentation: https://docs.nvidia.com/tensorrt/
+- Triton Inference Server documentation: https://docs.nvidia.com/deeplearning/triton-inference-server/

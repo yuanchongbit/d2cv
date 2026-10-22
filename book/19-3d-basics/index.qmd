@@ -5,36 +5,304 @@ title: "第 19 章 深度估计、点云与 3D 视觉基础"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
 - 前置：第 3、7 章
-- 预计篇幅：待定
+- 预计阅读：85 分钟
+- 算力：CPU 可完成坐标与点云实验；深度模型推理建议单卡 8 GB
 :::
 
-## 学习目标
+2D 视觉回答“图像里有什么”，3D 视觉还要回答“它在空间中的什么位置、离我多远”。这两个问题在自动驾驶里是同一件事的两面：检测框的像素位置不能直接送给规划器，必须结合相机内参、外参和深度，变成车体坐标系下的三维位置。
 
-- 掌握相机模型、坐标系与点云表示
-- 理解单目/双目深度与点云网络
-- 了解 NeRF/3DGS 的适用边界
+3D 视觉最常见的错误不是模型不够强，而是坐标系用错。相机坐标系的 $y$ 轴朝下，激光雷达的 $z$ 轴朝上，车体坐标系的 $x$ 轴朝前；一旦把某个轴的方向搞反，投影结果可能看起来“差不多”，但深度和横向位置全是错的。
 
-## 内容规划
+这一章先把坐标系、相机模型和点云表示讲清楚，再讨论单目/双目深度、PointNet/PointPillars、NeRF/3DGS 和 BEV。代码只依赖 PyTorch，重点在可验证的坐标变换。
 
-- 相机内参/外参、坐标系与标定
-- 双目与单目深度估计
-- 点云表示、PointNet、PointPillars
-- NeRF、3D Gaussian Splatting
-- BEV 与 occupancy 概念
+## 19.1 坐标系与相机模型
 
-## 动手
+一个 3D 点要变成像素，通常经过四步：
 
-用 Depth Anything/MiDaS 做深度估计，完成点云可视化与坐标变换。
+1. **世界坐标系**：场景的全局坐标，单位米；
+2. **相机坐标系**：以相机光心为原点，$x$ 向右、$y$ 向下、$z$ 沿光轴向前；
+3. **归一化像平面**：除以深度 $z$，得到 $x/z$、$y/z$；
+4. **像素坐标系**：乘内参矩阵 $K$，得到 $(u, v)$。
+
+$$
+\begin{bmatrix} u \\ v \\ 1 \end{bmatrix}
+\sim K \begin{bmatrix} R & t \end{bmatrix}
+\begin{bmatrix} X_w \\ Y_w \\ Z_w \\ 1 \end{bmatrix},
+\quad
+K = \begin{bmatrix}
+f_x & 0 & c_x \\
+0 & f_y & c_y \\
+0 & 0 & 1
+\end{bmatrix}
+$$
+
+$f_x, f_y$ 是以像素为单位的焦距，$c_x, c_y$ 是主点。$R, t$ 是相机外参，把世界坐标变换到相机坐标。
+
+```{python}
+#| label: projection
+import torch
+
+
+def project_points(points_world: torch.Tensor, K: torch.Tensor,
+                   R: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    points_cam = points_world @ R.T + t
+    z = points_cam[:, 2]
+    uv = points_cam @ K.T
+    uv = uv[:, :2] / z.clamp(min=1e-6).unsqueeze(1)
+    return uv, z
+
+
+def unproject_pixels(uv: torch.Tensor, depth: torch.Tensor,
+                     K: torch.Tensor) -> torch.Tensor:
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    x = (uv[:, 0] - cx) * depth / fx
+    y = (uv[:, 1] - cy) * depth / fy
+    return torch.stack([x, y, depth], dim=1)
+
+
+K = torch.tensor([[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]])
+R = torch.eye(3)
+t = torch.tensor([0.0, 0.0, 0.0])
+points = torch.tensor([[0.0, 0.0, 5.0], [1.0, 0.5, 8.0], [-2.0, -1.0, 10.0]])
+
+uv, z = project_points(points, K, R, t)
+print("pixels:\n", uv.round(decimals=1))
+print("depth:", z.tolist())
+recovered = unproject_pixels(uv, z, K)
+print("round trip max error:", (recovered - points).abs().max().item())
+```
+
+投影和反投影必须严格配对。`unproject_pixels` 假设相机坐标系下 $z$ 是深度；如果换成“到光心的欧氏距离”，公式里就要除以 $\sqrt{x^2+y^2+z^2}$，不能混用。
+
+内参不是模型的一部分，而是数据的一部分。图像被 resize 或 crop 后，内参也要同步变换：
+
+$$
+f_x' = f_x \cdot s_x, \quad c_x' = (c_x - \text{crop}_x) \cdot s_x
+$$
+
+$s_x$ 是水平缩放比。很多部署事故来自这里：训练时用 640×480，推理时 resize 到 1280×960，却仍然用原始内参投影，3D 位置整体偏移。
+
+## 19.2 从深度图到点云
+
+深度图给出每个像素的距离，结合内参即可反投影成点云：
+
+```{python}
+#| label: depth-to-cloud
+def depth_to_pointcloud(depth: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+    h, w = depth.shape
+    ys, xs = torch.meshgrid(
+        torch.arange(h, dtype=torch.float32),
+        torch.arange(w, dtype=torch.float32),
+        indexing="ij",
+    )
+    z = depth.reshape(-1)
+    x = (xs.reshape(-1) - K[0, 2]) * z / K[0, 0]
+    y = (ys.reshape(-1) - K[1, 2]) * z / K[1, 1]
+    return torch.stack([x, y, z], dim=1)
+
+
+depth = torch.full((4, 6), 5.0)
+cloud = depth_to_pointcloud(depth, K)
+valid = cloud[:, 2] > 0
+print("points:", tuple(cloud.shape))
+print("z range:", cloud[valid, 2].min().item(), cloud[valid, 2].max().item())
+print("first point:", cloud[0].tolist())
+```
+
+真实深度图有无效值（0、NaN、超过量程）。转点云前必须过滤，否则这些点会在后续聚类或检测中变成大量伪目标。
+
+深度评估常用三个指标：
+
+```{python}
+#| label: depth-metrics
+def depth_metrics(pred: torch.Tensor, gt: torch.Tensor,
+                  valid: torch.Tensor | None = None) -> dict[str, float]:
+    if valid is None:
+        valid = (gt > 0) & torch.isfinite(gt) & torch.isfinite(pred)
+    p, g = pred[valid], gt[valid]
+    abs_rel = ((p - g).abs() / g).mean().item()
+    rmse = ((p - g) ** 2).mean().sqrt().item()
+    ratio = torch.maximum(p / g, g / p)
+    delta1 = (ratio < 1.25).float().mean().item()
+    return {"AbsRel": abs_rel, "RMSE": rmse, "delta<1.25": delta1}
+
+
+gt = torch.tensor([5.0, 10.0, 20.0, 40.0])
+pred = torch.tensor([5.5, 9.0, 23.0, 36.0])
+print({k: round(v, 4) for k, v in depth_metrics(pred, gt).items()})
+```
+
+AbsRel 对近距离误差更敏感，RMSE 对大误差更敏感，$\delta<1.25$ 衡量预测是否落在真值附近 25% 的范围内。单目深度还存在**尺度歧义**：模型可能预测出正确的相对深度，但整体尺度差一个常数。评估前通常用中位数或最小二乘对齐尺度，并明确说明是否做了对齐。
+
+## 19.3 单目与双目深度
+
+单目深度估计从一张图预测深度。它依赖语义和透视线索（近大远小、遮挡、纹理梯度），在分布外场景容易失效。MiDaS 和 Depth Anything 通过大规模混合数据训练，得到相对深度；要变成度量深度，需要额外的尺度/偏移校准或使用专门训练的度量深度模型。
+
+双目深度用几何：左右相机有基线 $b$，同一个点在两幅图中的视差为 $d = x_l - x_r$，深度为：
+
+$$
+Z = \frac{f b}{d}
+$$
+
+视差越小，深度越大，误差也越大。双目在纹理丰富、光照稳定的场景很准，但在无纹理墙面、反光表面和远距离处会失效。
+
+单目 + 双目 + 激光雷达的融合是自动驾驶的常见组合：激光雷达提供精确但稀疏的深度，相机提供稠密语义，双目在中近距离补充几何。融合前必须统一时间戳和外参。
+
+## 19.4 点云表示与 PointPillars
+
+点云是 $N \times (3 + C)$ 的集合：$x, y, z$ 加反射强度、时间等特征。它有三个特点：
+
+- **无序**：点的排列顺序不影响语义；
+- **稀疏**：64 线激光雷达一帧约 10 万点，但体素网格大部分为空；
+- **密度不均**：近处点密，远处点稀。
+
+PointNet 用共享 MLP 逐点提特征，再用最大池化聚合，保证对排列不变。PointPillars 把点云投影到 BEV 的柱体（pillar）里，每个 pillar 内取点的统计特征，再用 2D CNN 检测。这样既保留了高度信息，又能复用成熟的 2D 检测结构。
+
+```{python}
+#| label: pillarize
+def pillarize(points: torch.Tensor, x_range: tuple[float, float] = (-20.0, 20.0),
+              y_range: tuple[float, float] = (-20.0, 20.0),
+              voxel_size: float = 0.5) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x_min, x_max = x_range
+    y_min, y_max = y_range
+    nx = int((x_max - x_min) / voxel_size)
+    ny = int((y_max - y_min) / voxel_size)
+
+    mask = ((points[:, 0] >= x_min) & (points[:, 0] < x_max)
+            & (points[:, 1] >= y_min) & (points[:, 1] < y_max) & (points[:, 2] > 0))
+    points = points[mask]
+
+    ix = ((points[:, 0] - x_min) / voxel_size).long().clamp(0, nx - 1)
+    iy = ((points[:, 1] - y_min) / voxel_size).long().clamp(0, ny - 1)
+    pillar_idx = ix * ny + iy
+    num_pillars = nx * ny
+
+    counts = torch.zeros(num_pillars).index_add_(
+        0, pillar_idx, torch.ones(len(points))
+    )
+    sums = torch.zeros(num_pillars, 3).index_add_(0, pillar_idx, points[:, :3])
+    max_z = torch.full((num_pillars,), -float("inf")).scatter_reduce_(
+        0, pillar_idx, points[:, 2], reduce="amax"
+    )
+
+    occupied = counts > 0
+    mean_xyz = sums[occupied] / counts[occupied].unsqueeze(1)
+    centers = torch.stack([
+        x_min + (torch.arange(num_pillars)[occupied] // ny + 0.5) * voxel_size,
+        y_min + (torch.arange(num_pillars)[occupied] % ny + 0.5) * voxel_size,
+    ], dim=1)
+    features = torch.cat([mean_xyz, max_z[occupied, None], counts[occupied, None]], dim=1)
+    return centers, features, occupied.sum()
+
+
+torch.manual_seed(0)
+points = torch.randn(5000, 4) * 15
+centers, features, num_occupied = pillarize(points)
+print("occupied pillars:", num_occupied.item())
+print("centers:", tuple(centers.shape), "features:", tuple(features.shape))
+print("feature sample:\n", features[:3].round(decimals=2))
+```
+
+每个 pillar 的特征可以扩展为“相对 pillar 中心的偏移、平均强度、点数和最大高度”。PointPillars 的检测头在 BEV 特征图上做 anchor 分类和框回归，框用 $(x, y, z, w, l, h, \theta)$ 表示。
+
+3D 检测的评估与 2D 不同：BEV IoU 只在俯视图计算，3D IoU 还要考虑高度和旋转角。KITTI 按难度（Easy/Moderate/Hard）和类别分别报告 AP，且 AP 的计算协议（11 点/40 点）会影响结果。
+
+## 19.5 NeRF 与 3D Gaussian Splatting
+
+NeRF 用隐式函数表示场景：给定位置 $\mathbf{x}$ 和方向 $\mathbf{d}$，MLP 输出颜色 $\mathbf{c}$ 和体密度 $\sigma$。渲染时沿光线积分：
+
+$$
+C(\mathbf{r}) = \int_{t_n}^{t_f} T(t) \sigma(\mathbf{x}(t)) \mathbf{c}(\mathbf{x}(t), \mathbf{d}) \, dt,
+\quad
+T(t) = \exp\left(-\int_{t_n}^{t} \sigma(\mathbf{x}(s)) \, ds\right)
+$$
+
+训练目标就是让渲染出的像素与真实像素一致。NeRF 重建质量高，但训练和渲染都慢，适合离线资产，不适合实时感知。
+
+3D Gaussian Splatting（3DGS）用一组显式高斯基元表示场景，每个基元有位置、协方差、颜色和不透明度。渲染时把这些基元投影到图像平面并按深度排序做 alpha 混合。它训练快、渲染快，但显存随场景规模增长，编辑和动态场景支持仍在发展中。
+
+两者的适用边界：
+
+| 方法 | 表示 | 优势 | 局限 |
+|---|---|---|---|
+| NeRF | 隐式 MLP | 质量高、视角一致 | 训练慢、渲染慢 |
+| 3DGS | 显式高斯基元 | 训练/渲染快、可编辑 | 显存大、几何不保证水密 |
+| 点云 | 离散点 | 直接来自传感器、几何准 | 稀疏、无颜色/纹理 |
+
+不要用新视角合成模型替代几何感知。NeRF/3DGS 的“深度”是渲染副产品，未必满足自动驾驶对度量精度的要求。
+
+## 19.6 BEV 与 Occupancy
+
+BEV（bird's-eye view）把场景投影到俯视平面，输出 $H \times W \times C$ 的特征图。它的好处是统一了相机、激光雷达和毫米波雷达的坐标，便于多传感器融合和规划。
+
+常见路线：
+
+- **Lift-Splat**：预测每个像素的深度分布，把图像特征“抬”到 3D 空间，再投影到 BEV；
+- **BEVFormer**：用可变形注意力从多相机特征采样到 BEV 查询；
+- **PointPillars / VoxelNet**：直接从点云体素化得到 BEV 特征。
+
+Occupancy 进一步预测三维体素是否被占用，以及占用类别。它比 BEV 框检测更能表达不规则障碍物（施工区域、掉落物），但标注和计算成本更高。
+
+BEV 的工程难点是坐标对齐：相机外参、 ego pose、时间同步任何一项有偏差，融合特征就会重影。上线前一定要做静态场景的投影检查：把激光雷达点投到图像上，看边缘是否对齐。
+
+## 19.7 用现成模型做深度估计
+
+```{python}
+#| label: depth-anything
+#| eval: false
+from PIL import Image
+from transformers import pipeline
+
+depth_estimator = pipeline(
+    task="depth-estimation",
+    model="depth-anything/Depth-Anything-V2-Small-hf",
+    device=0,
+)
+image = Image.open("street.jpg").convert("RGB")
+result = depth_estimator(image)
+depth = result["predicted_depth"]  # 相对深度，不是米
+print(depth.shape, depth.min().item(), depth.max().item())
+```
+
+Depth Anything 输出的是相对深度（affine-invariant），直接当米用会出错。若下游需要度量深度，必须在目标域上做尺度校准，或使用 Metric3D、ZoeDepth 等度量深度模型。
+
+## 19.8 工程坑
+
+::: {.callout-warning}
+## 3D 视觉的坐标陷阱
+
+- **轴方向混用**：相机 $y$ 向下、激光雷达 $z$ 向上，投影前没有换轴，画面“看起来对”但上下颠倒。
+- **内参与 resize 不同步**：图像缩放后仍用原主点，3D 框整体偏移。
+- **深度尺度未对齐**：相对深度直接当米，近处尚可、远处完全错误。
+- **点云范围设得太小**：裁剪掉了远处目标，检测召回凭空下降。
+- **体素尺寸与延迟不匹配**：0.1 m 体素精度高，但 BEV 网格增大 25 倍，显存和计算爆炸。
+- **标定时间戳过期**：相机或激光雷达重新安装后没有重标定，融合结果逐渐漂移。
+:::
+
+## 19.9 小结
+
+- 3D 视觉的第一性问题是坐标系：世界、相机、像素、激光雷达、车体之间必须显式变换。
+- 内参和外参是数据的一部分，resize、crop、重标定后都要同步更新。
+- 单目深度有尺度歧义，双目依赖视差和纹理，激光雷达提供精确但稀疏的几何。
+- PointNet 用对称函数处理无序点集，PointPillars 把点云转成 BEV 特征复用 2D 检测。
+- NeRF/3DGS 适合新视角合成，不直接替代度量几何；BEV/occupancy 是多传感器融合的公共表示。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+1. 给 `project_points` 加入畸变模型，比较针孔模型与径向畸变模型的投影差异。
+2. 写一个函数，同时变换图像、内参和 3D 框，验证 resize 后投影仍然对齐。
+3. 修改 `pillarize`，加入每个 pillar 内点的相对坐标，并比较检测特征维度。
+4. 用双目公式推导：基线加倍、焦距不变时，同一视差对应的深度如何变化？
+5. 设计一个 BEV 与相机投影对齐的检查流程，至少包含三项可量化指标。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- Qi et al., *PointNet: Deep Learning on Point Sets for 3D Classification and Segmentation*, 2017. [@qi2017pointnet]
+- Lang et al., *PointPillars: Fast Encoders for Object Detection from Point Clouds*, 2019. [@lang2019pointpillars]
+- Mildenhall et al., *NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis*, 2020. [@mildenhall2020nerf]
+- Kerbl et al., *3D Gaussian Splatting for Real-Time Radiance Field Rendering*, 2023. [@kerbl2023gs]
+- Geiger et al., *Are We Ready for Autonomous Driving? The KITTI Vision Benchmark Suite*, 2012. [@geiger2012kitti]

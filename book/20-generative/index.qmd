@@ -5,36 +5,327 @@ title: "第 20 章 生成模型"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
 - 前置：第 10 章
-- 预计篇幅：待定
+- 预计阅读：85 分钟
+- 算力：CPU 可完成扩散玩具实验；Stable Diffusion 推理建议单卡 12 GB 以上
 :::
 
-## 学习目标
+生成模型让计算机“画”出不存在但看起来合理的图像。它在设计、内容创作、数据增强和仿真里都有真实价值，也是过去几年视觉领域变化最快的方向。
 
-- 理解 VAE、GAN 与扩散模型的基本原理
-- 掌握 Latent Diffusion 与条件控制
-- 能正确解读 FID/CLIPScore 及其局限
+但生成模型的评估比分类难得多。分类有明确标签，生成没有唯一答案：一张图可以用无数种方式“正确”。FID 低不代表图像可用，CLIPScore 高也不代表没有幻觉。更现实的问题是版权、隐私和滥用：模型可能记住训练图，生成内容可能被用于欺诈。
 
-## 内容规划
+这一章按“原理—采样—条件控制—评测—边界”展开。VAE 和 GAN 讲清思想，扩散模型给出可运行的训练与采样，最后讨论 Latent Diffusion 和 Stable Diffusion 的工程结构。
 
-- VAE 与 GAN 回顾
-- DDPM、DDIM 与采样
-- Latent Diffusion 与 Stable Diffusion
-- ControlNet、LoRA 与条件生成
-- 生成质量评测与版权边界
+## 20.1 生成任务的谱系
 
-## 动手
+| 任务 | 输入 | 输出 | 代表模型 |
+|---|---|---|---|
+| 无条件生成 | 噪声 | 图像 | GAN、DDPM |
+| 类别条件生成 | 噪声 + 类别 | 图像 | cGAN、classifier-free diffusion |
+| 文生图 | 噪声 + 文本 | 图像 | Stable Diffusion、DALL·E |
+| 图像编辑 | 图像 + 指令/掩码 | 新图像 | ControlNet、inpainting |
+| 新视角合成 | 多视角图像 | 新视角 | NeRF、3DGS |
 
-完成文生图与 ControlNet 条件生成，做一次包含失败案例的系统评测。
+生成模型学习的本质是数据分布 $p(x)$。有的方法显式建模似然（VAE、扩散），有的隐式学习采样过程（GAN）。显式似然不一定生成得更好，隐式模型也不一定可控；选择取决于任务、训练稳定性和推理预算。
+
+## 20.2 VAE：带隐变量的自编码器
+
+VAE 假设图像 $x$ 由低维隐变量 $z$ 生成。编码器输出 $q_\phi(z \mid x)$ 的均值和对数方差，解码器输出 $p_\theta(x \mid z)$。训练最大化证据下界（ELBO）：
+
+$$
+\log p(x) \geq \mathbb{E}_{q_\phi(z \mid x)}[\log p_\theta(x \mid z)]
+- D_{\mathrm{KL}}(q_\phi(z \mid x) \,\|\, p(z))
+$$
+
+第一项是重建损失，第二项让隐分布接近先验（通常为标准正态）。为了让采样可微，使用重参数化技巧：
+
+$$
+z = \mu + \sigma \odot \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)
+$$
+
+```{python}
+#| label: vae-loss
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+
+class TinyVAE(nn.Module):
+    def __init__(self, input_dim: int = 64, latent_dim: int = 8) -> None:
+        super().__init__()
+        self.encoder = nn.Sequential(nn.Linear(input_dim, 32), nn.ReLU())
+        self.to_mean = nn.Linear(32, latent_dim)
+        self.to_logvar = nn.Linear(32, latent_dim)
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 32), nn.ReLU(), nn.Linear(32, input_dim)
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        h = self.encoder(x)
+        mean, logvar = self.to_mean(h), self.to_logvar(h)
+        std = torch.exp(0.5 * logvar)
+        z = mean + std * torch.randn_like(std)
+        return self.decoder(z), mean, logvar
+
+
+def vae_loss(recon: torch.Tensor, target: torch.Tensor,
+             mean: torch.Tensor, logvar: torch.Tensor, beta: float = 1.0) -> torch.Tensor:
+    recon_loss = F.mse_loss(recon, target, reduction="sum") / target.size(0)
+    kl = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp(), dim=1).mean()
+    return recon_loss + beta * kl
+
+
+model = TinyVAE()
+x = torch.randn(16, 64)
+recon, mean, logvar = model(x)
+print("reconstruction:", tuple(recon.shape), "latent:", tuple(mean.shape))
+print("loss:", round(vae_loss(recon, x, mean, logvar).item(), 3))
+```
+
+VAE 的生成图像往往偏模糊，因为 MSE 重建损失对应高斯似然，倾向于平均多个可能的结果。$\beta$-VAE 通过调大 KL 权重换取更解耦的隐空间，但重建质量会进一步下降。
+
+## 20.3 GAN：对抗训练
+
+GAN 同时训练生成器 $G$ 和判别器 $D$：
+
+$$
+\min_G \max_D \; \mathbb{E}_{x \sim p_{\text{data}}}[\log D(x)]
++ \mathbb{E}_{z \sim p(z)}[\log(1 - D(G(z)))]
+$$
+
+生成器试图骗过判别器，判别器试图区分真假。理想情况下，生成分布与真实分布重合，判别器输出恒为 0.5。
+
+GAN 的训练问题是出了名的不稳定：
+
+- **模式崩溃**：生成器只生成少数几个样本，判别器无法提供有效梯度；
+- **训练震荡**：生成器和判别器的能力此消彼长，损失曲线没有稳定下降；
+- **评估困难**：损失值不能直接反映生成质量。
+
+WGAN、谱归一化、TTUR 等技巧缓解了部分问题，但 GAN 的训练仍然依赖经验和大量调参。相比之下，扩散模型的训练目标更稳定，这是它成为主流生成范式的重要原因。
+
+## 20.4 扩散模型：加噪与去噪
+
+扩散模型定义一条前向加噪链：从真实图像 $x_0$ 开始，逐步加入高斯噪声，直到 $x_T$ 近似标准正态。每一步：
+
+$$
+q(x_t \mid x_{t-1}) = \mathcal{N}\left(\sqrt{1 - \beta_t} x_{t-1}, \beta_t I\right)
+$$
+
+利用重参数化，可以直接从 $x_0$ 采样任意时刻的 $x_t$：
+
+$$
+x_t = \sqrt{\bar{\alpha}_t} x_0 + \sqrt{1 - \bar{\alpha}_t} \epsilon,
+\quad \epsilon \sim \mathcal{N}(0, I),
+\quad \bar{\alpha}_t = \prod_{s=1}^{t}(1 - \beta_s)
+$$
+
+训练一个网络 $\epsilon_\theta(x_t, t)$ 预测噪声，损失就是简单的均方误差：
+
+$$
+\mathcal{L} = \mathbb{E}_{x_0, t, \epsilon}\left[\|\epsilon - \epsilon_\theta(x_t, t)\|^2\right]
+$$
+
+```{python}
+#| label: ddpm-toy
+import torch
+from torch import nn
+
+torch.manual_seed(0)
+T = 100
+betas = torch.linspace(1e-4, 0.02, T)
+alphas = 1 - betas
+alphas_bar = torch.cumprod(alphas, dim=0)
+
+
+def make_data(n: int) -> torch.Tensor:
+    centers = torch.tensor([[-2.0, -2.0], [2.0, 2.0], [-2.0, 2.0], [2.0, -2.0]])
+    idx = torch.randint(0, 4, (n,))
+    return centers[idx] + 0.35 * torch.randn(n, 2)
+
+
+class Denoiser(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(3, 64), nn.SiLU(), nn.Linear(64, 64), nn.SiLU(), nn.Linear(64, 2)
+        )
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([x, (t.float() / T).unsqueeze(1)], dim=1))
+
+
+def q_sample(x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+    ab = alphas_bar[t].unsqueeze(1)
+    return ab.sqrt() * x0 + (1 - ab).sqrt() * noise
+
+
+model = Denoiser()
+optimizer = torch.optim.Adam(model.parameters(), lr=2e-3)
+for step in range(600):
+    x0 = make_data(256)
+    t = torch.randint(0, T, (256,))
+    noise = torch.randn_like(x0)
+    loss = ((model(q_sample(x0, t, noise), t) - noise) ** 2).mean()
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+print("final noise-prediction loss:", round(loss.item(), 4))
+
+
+@torch.no_grad()
+def sample(n: int = 2000) -> torch.Tensor:
+    x = torch.randn(n, 2)
+    for t in reversed(range(T)):
+        tt = torch.full((n,), t, dtype=torch.long)
+        eps = model(x, tt)
+        alpha, ab = alphas[t], alphas_bar[t]
+        mean = (x - (1 - alpha) / (1 - ab).sqrt() * eps) / alpha.sqrt()
+        x = mean + betas[t].sqrt() * torch.randn_like(x) if t > 0 else mean
+    return x
+
+
+data = make_data(5000)
+samples = sample()
+print("data   mean:", data.mean(0).round(decimals=2).tolist(),
+      "std:", data.std(0).round(decimals=2).tolist())
+print("sample mean:", samples.mean(0).round(decimals=2).tolist(),
+      "std:", samples.std(0).round(decimals=2).tolist())
+```
+
+这个二维实验展示了扩散模型的核心循环：训练时随机选时刻加噪、预测噪声；采样时从纯噪声出发，逐步去噪。生成样本的均值和标准差接近四个簇的分布，但单个样本是否落在正确簇，需要更大的网络和更多训练。
+
+前向过程有一个重要的性质：$t$ 越大，信噪比（SNR）越低。定义 $\mathrm{SNR}(t) = \bar{\alpha}_t / (1 - \bar{\alpha}_t)$，它从很大降到接近 0。这也解释了为什么时间步编码对模型至关重要：不同 $t$ 的输入分布差异巨大。
+
+## 20.5 DDIM 与无分类器引导
+
+DDPM 采样要跑完 $T$ 步，速度慢。DDIM 构造一个非马尔可夫的反向过程，允许跳步采样：用相同的训练目标，在推理时只取一部分时间步，就能大幅加速。
+
+无分类器引导（classifier-free guidance, CFG）是条件生成的关键技巧。训练时以一定概率丢弃条件，得到条件与无条件两个噪声预测；采样时外推：
+
+$$
+\hat{\epsilon} = \epsilon_\theta(x_t, \varnothing)
++ s \left(\epsilon_\theta(x_t, c) - \epsilon_\theta(x_t, \varnothing)\right)
+$$
+
+$s$ 是引导强度。$s=1$ 等价于普通条件采样，$s>1$ 增强条件一致性，但过高会导致过饱和、细节僵硬和多样性下降。实际使用中要同时报告 $s$ 与采样步数，否则结果不可复现。
+
+## 20.6 Latent Diffusion 与 Stable Diffusion
+
+在高分辨率像素空间直接做扩散，计算量随 $H \times W$ 增长，难以承受。Latent Diffusion 先用 VAE 把图像压缩到潜空间（通常是 1/8 分辨率），在潜空间做扩散，最后用解码器还原图像。
+
+Stable Diffusion 的结构可以拆成三块：
+
+- **VAE**：图像与潜变量之间的编码/解码；
+- **U-Net**：在潜空间预测噪声，接受文本条件；
+- **文本编码器**：CLIP 文本编码器，把提示变成条件向量。
+
+文本条件通过交叉注意力注入 U-Net。ControlNet 复制一份 U-Net 编码器，加入边缘、深度、姿态等空间条件，并通过零初始化卷积连接到原模型，从而在不破坏原模型的情况下实现结构控制。
+
+LoRA 在扩散模型里同样适用：冻结 U-Net，只训练低秩增量，用几十张图就能适配一种风格或角色。第 12 章的 LoRA 实现可以直接复用。
+
+```{python}
+#| label: stable-diffusion
+#| eval: false
+import torch
+from diffusers import StableDiffusionPipeline
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16
+).to("cuda")
+pipe.set_progress_bar_config(disable=True)
+
+image = pipe(
+    prompt="a photo of a red bicycle on a cobblestone street, morning light",
+    negative_prompt="blurry, low quality, watermark",
+    num_inference_steps=30,
+    guidance_scale=7.5,
+    generator=torch.Generator(device="cuda").manual_seed(42),
+).images[0]
+image.save("bicycle.png")
+```
+
+同一个 prompt 在不同随机种子下会得到完全不同的构图；同一个种子在不同模型版本、不同 diffusers 版本下也未必复现。生成实验必须记录模型 id、权重哈希、采样器、步数、CFG 和种子。
+
+## 20.7 评估：FID、CLIPScore 与人工评估
+
+FID（Frechet inception distance）用 Inception 网络提取真实图像和生成图像的特征，分别拟合高斯分布，再计算两个分布之间的 Frechet 距离：
+
+$$
+\mathrm{FID} = \|\mu_r - \mu_g\|^2
++ \mathrm{Tr}\left(\Sigma_r + \Sigma_g - 2(\Sigma_r \Sigma_g)^{1/2}\right)
+$$
+
+FID 越低越好，但它有几个问题：
+
+- 依赖 Inception 特征，对纹理和风格偏差敏感；
+- 样本量小时估计不稳定；
+- 只比较分布，不衡量单张图是否符合 prompt；
+- 不同实现（resize、插值、特征层）结果不可直接比较。
+
+CLIPScore 计算生成图与文本的 CLIP 相似度，衡量语义对齐，但不能判断细节正确性、空间关系或计数。一个高频失败模式是：CLIPScore 很高，但图中人有六根手指。
+
+更完整的评估应包含：
+
+| 维度 | 指标/方法 |
+|---|---|
+| 分布质量 | FID、KID、precision/recall |
+| 语义对齐 | CLIPScore、人工评分 |
+| 多样性 | 同一 prompt 多种子的 LPIPS 距离 |
+| 结构正确性 | 目标检测/分割/姿态模型辅助检查 |
+| 安全与合规 |  NSFW 分类器、水印检测、版权比对 |
+
+生成模型的评测没有单一数字。上线前应该固定一组 prompt、固定种子集合，同时看自动指标和分层人工评估。
+
+## 20.8 版权、隐私与滥用边界
+
+生成模型带来的风险是真实的：
+
+- 训练数据可能包含受版权保护的作品，生成结果可能与其高度相似；
+- 模型可能记住训练集中的个人图像或敏感信息；
+- 生成技术可被用于伪造身份、制造虚假证据；
+- 未经授权的人脸生成/换脸涉及肖像权和同意问题。
+
+工程上可以采取的措施包括：数据来源审计、去重与记忆检测、输出水印、NSFW/暴力内容过滤、使用日志与滥用检测。但这些都不是万无一失的，高风险场景需要人工审核和法律评估。
+
+本书只讨论防御性与合规的生成应用，不提供规避检测或伪造身份的方法。
+
+## 20.9 工程坑
+
+::: {.callout-warning}
+## 生成模型落地注意
+
+- **只报 FID**：分布指标好不代表 prompt 对齐、结构正确或内容安全。
+- **采样配置不可复现**：模型版本、采样器、步数、CFG、种子缺一不可。
+- **CFG 过高**：颜色过饱和、细节僵硬，多样性下降。
+- **潜空间分辨率算错**：VAE 下采样 8 倍，输入不是 8 的倍数时边缘出现拼接痕迹。
+- **LoRA 权重与底座不匹配**：形状能加载，语义已经错位。
+- **忽略内容审核**：上线后出现违规内容，代价远高于模型指标下降。
+:::
+
+## 20.10 小结
+
+- VAE 用隐变量和 ELBO 建模数据分布，生成偏模糊；GAN 用对抗训练，质量高但难训。
+- 扩散模型通过加噪/去噪学习分布，训练目标稳定，已成为文生图的主流。
+- DDIM 加速采样，CFG 增强条件一致性，Latent Diffusion 把计算搬到潜空间。
+- ControlNet 提供空间条件，LoRA 提供低成本适配。
+- FID、CLIPScore 各有盲区，生成评估必须结合人工与任务特定检查。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+1. 把 20.4 的二维扩散模型改成 8 个簇，观察采样结果与训练步数的关系。
+2. 实现 DDIM 采样，比较 100 步 DDPM 与 20 步 DDIM 的样本均值和方差。
+3. 用同一个 prompt、不同 CFG 生成一组图，分析饱和度和多样性的变化。
+4. 设计一个生成图像的结构正确性检查流程，至少使用两个下游视觉模型。
+5. 写一份文生图模型的上线前评估清单，覆盖质量、对齐、安全与版权。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- Kingma and Welling, *Auto-Encoding Variational Bayes*, 2014.
+- Goodfellow et al., *Generative Adversarial Networks*, 2014.
+- Ho et al., *Denoising Diffusion Probabilistic Models*, 2020. [@ho2020ddpm]
+- Song et al., *Denoising Diffusion Implicit Models*, 2021.
+- Rombach et al., *High-Resolution Image Synthesis with Latent Diffusion Models*, 2022. [@rombach2022ldm]
+- Zhang et al., *Adding Conditional Control to Text-to-Image Diffusion Models*, 2023. [@zhang2023controlnet]

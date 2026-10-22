@@ -5,36 +5,218 @@ title: "第 21 章 视觉-语言模型"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
 - 前置：第 10、12 章
-- 预计篇幅：待定
+- 预计阅读：80 分钟
+- 算力：CPU 可完成检索指标实验；7B VLM 推理建议单卡 16 GB 以上
 :::
 
-## 学习目标
+视觉-语言模型（vision-language model, VLM）让模型同时理解图像和文本。它可以零样本分类、生成图像描述、回答关于图像的问题，也可以把自然语言变成检测和分割的提示。
 
-- 理解 CLIP 对比学习与 zero-shot 迁移
-- 掌握 BLIP-2/LLaVA 的架构与训练范式
-- 能评估开放词汇检测/分割与幻觉
+这类模型最危险的特性是“流畅地犯错”。一个分类器预测错了，你会看到低置信度；一个 VLM 生成了错误描述，语言仍然通顺、语气仍然自信。上线前如果不做事实性评估，用户很难分辨模型是在描述图像，还是在根据语言先验编故事。
 
-## 内容规划
+这一章按能力分层：对比学习做检索和零样本分类，生成式模型做描述与问答，开放词汇模型做定位。每层都给出评估方法和失败模式。
 
-- CLIP 与图文对比学习
-- BLIP-2、LLaVA 与视觉指令微调
-- 图像描述、VQA 与检索
-- 开放词汇检测/分割
-- 幻觉、评测与安全边界
+## 21.1 三类视觉-语言能力
 
-## 动手
+| 能力 | 代表模型 | 输出 | 典型任务 |
+|---|---|---|---|
+| 对比对齐 | CLIP | 图像/文本嵌入 | 检索、零样本分类 |
+| 生成式理解 | BLIP-2、LLaVA | 文本 | 描述、VQA、对话 |
+| 开放词汇定位 | Grounding DINO + SAM | 框/掩码 | 开放词汇检测、分割 |
 
-本地运行一个 VLM，比较不同提示策略在描述、VQA 与开放词汇任务上的表现。
+三类模型的训练目标不同，评估也不能混用。CLIP 的 zero-shot 准确率高，不代表它能生成准确描述；LLaVA 的描述流畅，不代表它的空间定位可靠。
+
+## 21.2 CLIP：把图像和文本放进同一个空间
+
+CLIP 用两个编码器分别处理图像和文本，再通过对比损失对齐。一个批次有 $N$ 对图文，图像嵌入 $\mathbf{u}_i$、文本嵌入 $\mathbf{v}_j$，相似度矩阵为：
+
+$$
+S_{ij} = \frac{\mathbf{u}_i^\top \mathbf{v}_j}{\|\mathbf{u}_i\| \|\mathbf{v}_j\| \tau}
+$$
+
+训练目标是让对角线上的正样本相似度升高，非对角线上的负样本降低。损失是行方向和列方向的交叉熵之和，与第 11 章的 InfoNCE 相同。
+
+推理时，把类别名编码成文本，取相似度最高的类别即可做零样本分类。检索任务则按相似度排序，报告 Recall@K：
+
+```{python}
+#| label: retrieval
+import torch
+import torch.nn.functional as F
+
+
+def recall_at_k(image_emb: torch.Tensor, text_emb: torch.Tensor,
+                k: int = 1) -> float:
+    image_emb = F.normalize(image_emb, dim=-1)
+    text_emb = F.normalize(text_emb, dim=-1)
+    sim = image_emb @ text_emb.T
+    ranks = sim.argsort(dim=1, descending=True)
+    targets = torch.arange(len(image_emb)).unsqueeze(1)
+    return (ranks[:, :k] == targets).any(dim=1).float().mean().item()
+
+
+torch.manual_seed(0)
+image_emb = torch.randn(16, 16)
+text_emb = image_emb + 2.0 * torch.randn(16, 16)  # 模拟有噪声的配对文本
+print("R@1:", recall_at_k(image_emb, text_emb, k=1))
+print("R@4:", recall_at_k(image_emb, text_emb, k=4))
+```
+
+真实检索还要考虑：
+
+- 图像和文本的嵌入是否做了 L2 归一化；
+- 是否使用多语言/多提示模板；
+- 候选集大小，R@1 在 100 个候选和 100 万个候选下含义完全不同；
+- 是否允许同一张图对应多个文本（一对多会拉低 R@K）。
+
+CLIP 的零样本分类对提示词敏感。可以用 prompt ensemble：把“a photo of a {}”“a blurry photo of a {}”等多个模板的文本嵌入平均，降低单模板偏差。但平均后的向量不再对应任何一句话，解释性会下降。
+
+## 21.3 BLIP-2 与 LLaVA
+
+BLIP-2 的结构是“冻结图像编码器 + Q-Former + 冻结语言模型”。Q-Former 用一组可学习查询从图像特征中提取与文本相关的信息，再投影到语言模型的嵌入空间。训练分两阶段：先做图文对比/匹配/生成，再接入语言模型做生成式训练。冻结大部分参数大幅降低了训练成本。
+
+LLaVA 更直接：用 CLIP 视觉编码器提取 patch 特征，经过一个线性投影层映射到语言模型的 token 空间，再把图像 token 与文本指令拼在一起做指令微调。它的关键贡献不是结构，而是**视觉指令数据**：把图像描述、问答、复杂推理转成对话格式，让模型学会按指令回答。
+
+两者共同的工程问题：
+
+- 图像分辨率决定小目标与文字识别能力，高分辨率会显著增加 token 数；
+- 视觉 token 与文本 token 的配额需要平衡，图太多会挤占上下文；
+- 指令微调数据的质量比数量更重要，错误答案会被模型模仿；
+- 多图、视频、文档等输入需要额外的位置编码和采样策略。
+
+## 21.4 开放词汇检测与分割
+
+传统检测器的类别在训练时固定。开放词汇模型用文本编码器把类别名变成嵌入，再与区域特征匹配，从而支持任意类别描述。
+
+Grounding DINO 把文本提示注入检测 Transformer，输出与短语对应的框；SAM 接收框或点提示，输出精细掩码。两者组合可以实现“用一句话分割任意目标”：
+
+```{python}
+#| label: grounding-sam
+#| eval: false
+import torch
+from groundingdino.util.inference import load_model, load_image, predict
+from segment_anything import SamPredictor, sam_model_registry
+
+dino = load_model("GroundingDINO_SwinT_OGC.py", "groundingdino_swint_ogc.pth")
+image_source, image = load_image("street.jpg")
+boxes, logits, phrases = predict(
+    model=dino,
+    image=image,
+    caption="pedestrian . bicycle . traffic light",
+    box_threshold=0.35,
+    text_threshold=0.25,
+)
+
+sam = sam_model_registry["vit_h"](checkpoint="sam_vit_h_4b8939.pth")
+predictor = SamPredictor(sam)
+predictor.set_image(image_source)
+for box in boxes:
+    masks, scores, _ = predictor.predict(box=box.numpy(), multimask_output=False)
+    print(phrases, scores)
+```
+
+这条流水线的误差会累积：检测框漏了，SAM 不可能补回来；文本提示写得不具体，检测框会乱指；阈值调得太低，背景被当成目标。评估时要分别报告检测 AP、掩码 IoU 和端到端成功率，不能只报一个“看起来不错”的 demo。
+
+开放词汇模型的“开放”也有边界。它们对训练分布中的概念更强，对罕见物体、细粒度属性和组合关系（“左边那只戴帽子的狗”）仍然脆弱。
+
+## 21.5 本地运行一个 VLM
+
+```{python}
+#| label: vlm-inference
+#| eval: false
+import torch
+from PIL import Image
+from transformers import AutoProcessor, LlavaForConditionalGeneration
+
+model_id = "llava-hf/llava-1.5-7b-hf"
+processor = AutoProcessor.from_pretrained(model_id)
+model = LlavaForConditionalGeneration.from_pretrained(
+    model_id, torch_dtype=torch.float16, device_map="auto"
+).eval()
+
+image = Image.open("street.jpg").convert("RGB")
+prompt = "USER: <image>\nDescribe the traffic scene and list any safety risks.\nASSISTANT:"
+inputs = processor(text=prompt, images=image, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    output = model.generate(**inputs, max_new_tokens=128, do_sample=False)
+print(processor.decode(output[0], skip_special_tokens=True))
+```
+
+`do_sample=False` 让输出可复现，但会降低多样性；对话产品通常用采样并设置温度。无论哪种方式，评估时都要固定解码参数。
+
+## 21.6 评估：描述、问答与幻觉
+
+不同任务的指标不同：
+
+- **图像描述**：BLEU、METEOR、CIDEr、SPICE。CIDEr 用 TF-IDF 加权 n-gram，和人类判断相关性较好，但对同义改写不敏感。
+- **VQA**：开放问答用精确匹配或 LLM 评分；选择题用准确率，但要检查选项顺序偏差。
+- **检索**：Recall@K、mAP。
+- **开放词汇检测/分割**：在固定类别集上算 AP/mask AP，并单独报告新类别的表现。
+- **幻觉**：POPE 等方法用“图中是否存在某物体”的是/否问题，衡量模型是否凭空肯定不存在的物体。
+
+生成式评估最容易被忽视的是**评估集泄漏**。VLM 的预训练数据规模巨大，公开 benchmark 很可能已被见过。报告结果时应注明模型版本、训练数据截止时间和是否做了污染检查。
+
+用另一个 LLM 当裁判（LLM-as-a-judge）也有偏差：裁判偏好长回答、格式工整的回答，甚至会被提示注入。关键决策不能只依赖自动评分。
+
+## 21.7 幻觉从哪里来
+
+VLM 的幻觉通常有四类来源：
+
+1. **视觉信息不足**：分辨率低、遮挡、图像模糊，模型用语言先验补全。
+2. **语言先验过强**：图中是狗，但 prompt 反复提“猫”，模型顺着说猫。
+3. **训练数据偏差**：常见共现（厨房—冰箱）被错误套用到新场景。
+4. **解码策略**：高温采样增加多样性，也增加胡编的概率。
+
+缓解手段包括：提高输入分辨率、要求模型引用图像区域、引入检测/分割工具做 grounding、允许“不确定”回答、用多轮提问交叉验证、对关键字段做规则校验。
+
+但没有任何方法能完全消除幻觉。高风险场景（医疗、工业质检、自动驾驶）必须保留人工复核或独立的几何/传感器校验。
+
+## 21.8 安全与滥用边界
+
+VLM 可以读取图像中的文字、识别身份、推断场景，带来隐私风险。部署时需要考虑：
+
+- 是否上传原图到第三方 API，数据保留多久；
+- 是否需要对人物、车牌、证件做脱敏；
+- 模型是否会被 prompt injection 操纵，泄露系统提示或执行未授权操作；
+- 生成内容是否需要标注“AI 生成”。
+
+本章只讨论评估与防御，不提供绕过安全机制或批量生成虚假信息的方法。
+
+## 21.9 工程坑
+
+::: {.callout-warning}
+## VLM 落地的常见问题
+
+- **只测 benchmark，不测业务分布**：公开集分数高，业务图上的小字、遮挡和特殊光照全错。
+- **忽略图像分辨率**：resize 到 224 后文字不可读，却怪模型“不认识字”。
+- **提示词泄漏答案**：prompt 里已经写了类别，模型只是复述。
+- **用 LLM 裁判替代人工**：裁判偏好长答案，评分与事实性脱节。
+- **不做拒答设计**：模型对不存在的东西也会自信描述。
+- **忽略推理成本**：7B 模型加高分辨率图像，延迟和显存可能超出预算。
+:::
+
+## 21.10 小结
+
+- CLIP 用对比学习对齐图文，适合检索和零样本分类；提示词和候选集影响很大。
+- BLIP-2 用 Q-Former 连接冻结编码器与语言模型，LLaVA 用投影层 + 视觉指令微调。
+- 开放词汇检测/分割把文本提示接入检测器和分割器，误差会沿流水线累积。
+- VLM 评估要覆盖描述、问答、检索、定位和幻觉，不能只看一个流畅的 demo。
+- 幻觉来自视觉信息不足、语言先验、数据偏差和解码策略，需要工具校验与人工复核兜底。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+1. 用 21.2 的 `recall_at_k` 比较单模板与 prompt ensemble 的检索结果。
+2. 设计一个包含 20 个问题的 VQA 小测试集，分别统计整体准确率和按难度分层的准确率。
+3. 用 POPE 的思路构造 20 个“存在/不存在”问题，评估一个 VLM 的幻觉率。
+4. 比较 Grounding DINO 在不同文本提示（类别名 vs 完整描述）下的检测框差异。
+5. 写一份 VLM 上线前的风险评估表，覆盖隐私、幻觉、延迟和滥用。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- Radford et al., *Learning Transferable Visual Models From Natural Language Supervision*, 2021. [@radford2021clip]
+- Li et al., *BLIP-2: Bootstrapping Language-Image Pre-training with Frozen Image Encoders and Large Language Models*, 2023. [@li2023blip2]
+- Liu et al., *Visual Instruction Tuning*, 2023. [@liu2023llava]
+- Liu et al., *Grounding DINO: Marrying DINO with Grounded Pre-Training for Open-Set Object Detection*, 2024. [@liu2023groundingdino]
+- Kirillov et al., *Segment Anything*, 2023. [@kirillov2023sam]

@@ -5,36 +5,253 @@ title: "第 22 章 数据工程与标注"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
 - 前置：第 1 章
-- 预计篇幅：待定
+- 预计阅读：75 分钟
+- 算力：CPU 即可
 :::
 
-## 学习目标
+模型效果的上限通常由数据决定，但数据工作是全书最不“性感”的部分。一个团队可能花几周调模型，最后发现验证集里混进了训练集的近重复图；也可能标注规范写了十页，标注员仍然对“遮挡 50% 的车辆是否标框”理解不一致。
 
-- 掌握数据采集、清洗、标注与质检流程
-- 理解长尾、合成数据与数据版本化
-- 能写出一份合格的数据集说明
+这一章不讲某个新模型，而是讲一套能复用的数据流程：采集、清洗、标注、质检、版本化、划分。目标不是“数据越多越好”，而是让数据可追溯、可复现、可审计。
 
-## 内容规划
+## 22.1 数据生命周期
 
-- 采集、清洗与去重
-- 标注规范、质检与一致性
-- 数据版本化与 datasheet
-- 长尾、类别不均衡与合成数据
-- 隐私、许可与合规
+一个可维护的数据集通常经历六个阶段：
 
-## 动手
+| 阶段 | 产出 | 关键问题 |
+|---|---|---|
+| 需求 | 类别表、采集计划 | 任务定义是否清晰 |
+| 采集 | 原始数据、许可记录 | 来源是否合法、是否覆盖目标域 |
+| 清洗 | 去重、坏样本过滤 | 是否误删稀有但有效的样本 |
+| 标注 | 标签、规范、争议记录 | 一致性是否达标 |
+| 质检 | 抽检报告、修正记录 | 抽样是否有偏 |
+| 版本化 | manifest、datasheet | 能否复现某次训练 |
 
-从零构建一个小型标注数据集，完成一致性抽检并写 datasheet。
+数据不是一次性资产。模型上线后会出现新的失败模式，数据要持续回流、标注、评估，再进入下一轮训练。
+
+## 22.2 采集、许可与隐私
+
+采集前先写清三件事：
+
+- **任务定义**：类别、边界、忽略区域、标注粒度；
+- **数据来源**：自采、公开数据集、客户数据、合成数据；
+- **许可与隐私**：是否允许训练、是否允许商用、是否包含人脸/车牌/位置信息。
+
+公开数据集的许可差异很大。有的只允许研究用途，有的要求衍生作品同样开源，有的禁止再分发。把多个数据集混合训练前，要逐项核对许可，而不是只看仓库 README 的一句话。
+
+隐私处理包括：人脸/车牌模糊化、元数据剥离、访问控制、最小化保留。模糊化本身可能破坏标签（例如车牌识别任务），需要在任务需求和合规之间做明确取舍。
+
+## 22.3 清洗：重复、损坏与标签错误
+
+数据清洗最先做的是**去重**。重复样本会造成两个问题：训练集过拟合到重复图，验证集指标虚高。
+
+- **精确重复**：文件字节相同，用 SHA-256 即可发现。
+- **近重复**：分辨率、亮度、裁剪、压缩不同，需要感知哈希或嵌入距离。
+- **语义重复**：同一场景的连续帧、同一物体的多角度拍摄，严格来说不是重复，但会让划分泄漏。
+
+下面用差值哈希（difference hash, dHash）演示近重复检测：
+
+```{python}
+#| label: dhash
+import numpy as np
+import torch
+from PIL import Image, ImageEnhance
+
+
+def dhash(image: Image.Image, hash_size: int = 8) -> int:
+    gray = image.convert("L").resize((hash_size + 1, hash_size), Image.BILINEAR)
+    pixels = np.asarray(gray, dtype=np.int16)
+    bits = pixels[:, 1:] > pixels[:, :-1]
+    value = 0
+    for bit in bits.flatten():
+        value = (value << 1) | int(bit)
+    return value
+
+
+def hamming(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
+
+
+generator = torch.Generator().manual_seed(0)
+base = (torch.rand(128, 128, 3, generator=generator) * 255).byte()
+image = Image.fromarray(base.numpy())
+bright = ImageEnhance.Brightness(image).enhance(1.2)
+other = Image.fromarray((torch.rand(128, 128, 3, generator=generator) * 255).byte().numpy())
+
+h_base, h_bright, h_other = dhash(image), dhash(bright), dhash(other)
+print("base vs bright:", hamming(h_base, h_bright))
+print("base vs other: ", hamming(h_base, h_other))
+```
+
+亮度变化后哈希距离通常很小，而完全不同的图距离较大。实际系统会设定阈值（例如 10），并把哈希分桶做近似检索；阈值需要在业务数据上校准。
+
+除了重复，还要检查：
+
+- 文件能否解码，尺寸、通道数是否异常；
+- 标注框是否越界、宽高是否为零；
+- 类别 id 是否在允许集合内；
+- 图像与标签是否错配（文件名、时间戳、采集批次）。
+
+标签错误比坏图更隐蔽。常用手段是模型辅助审查：用已训练模型预测，挑出高置信度与标注不一致的样本人工复核。但模型本身有偏差，不能把它的预测直接当真值。
+
+## 22.4 标注规范与一致性
+
+一份可执行的标注规范至少包含：
+
+1. 类别定义与边界案例（“人物”是否包含雕像、海报中的人）；
+2. 框的贴合规则（包含全部可见部分，还是只包含未遮挡部分）；
+3. 最小目标尺寸、截断目标、遮挡目标的处理；
+4. 忽略区域（ignore）与 crowd 的标注方式；
+5. 正负样本示例图，每类至少 5 个边界案例。
+
+规范写完不等于执行一致。用 Cohen's kappa 衡量两个标注员在分类任务上的一致性：
+
+```{python}
+#| label: kappa
+def cohen_kappa(a: list[int], b: list[int], labels: list[int]) -> float:
+    n = len(a)
+    observed = sum(x == y for x, y in zip(a, b)) / n
+    expected = sum((a.count(c) / n) * (b.count(c) / n) for c in labels)
+    return (observed - expected) / (1 - expected)
+
+
+annotator_a = [0, 1, 0, 1, 1, 2, 2, 0, 1, 2]
+annotator_b = [0, 1, 0, 1, 0, 2, 2, 0, 2, 2]
+print("agreement:", sum(x == y for x, y in zip(annotator_a, annotator_b)) / len(annotator_a))
+print("kappa:", round(cohen_kappa(annotator_a, annotator_b, [0, 1, 2]), 3))
+```
+
+一致率 0.8 看起来不错，但 kappa 扣除了随机一致的部分。kappa 低于 0.6 通常说明规范有歧义，应该先修规范，而不是继续堆标注量。
+
+目标检测和分割的一致性更复杂：框 IoU、掩码 IoU、类别是否一致要分开统计。两个标注员的框平均 IoU 只有 0.7，意味着模型学到的“真值”本身就有很大噪声。
+
+## 22.5 质检流程
+
+一个可操作的质检流程：
+
+1. **培训与考核**：标注员先标一小批 gold set，达到阈值才进入正式任务。
+2. **双标抽样**：随机抽取 5%–10% 做双人标注，计算一致性。
+3. **专家复核**：对低一致性类别、边界案例和高风险样本做专家审核。
+4. **模型辅助**：用模型找异常，但只作为线索，不作为最终裁决。
+5. **回流**：把修正结果写回规范，定期更新示例库。
+
+抽检不能只抽“看起来正常”的样本。应按类别、难度、采集批次分层抽样，否则稀有类别和夜间场景永远抽不到。
+
+## 22.6 长尾与类别不均衡
+
+真实数据通常长尾：常见类别占绝大多数，稀有类别样本很少。直接训练会让模型偏向头部类别。常见处理：
+
+- **重采样**：过采样稀有类，或欠采样头部类；
+- **损失加权**：给稀有类更高权重；
+- **分层划分**：保证每个 split 都有稀有类；
+- **数据增强**：对稀有类做更强的几何/颜色增强；
+- **合成数据**：渲染或生成稀有场景，但必须验证域差距。
+
+```{python}
+#| label: long-tail
+counts = torch.tensor([1000, 500, 100, 20, 5, 2])
+labels = torch.repeat_interleave(torch.arange(len(counts)), counts)
+beta = 0.5
+class_weights = (1.0 / counts.float()) ** beta
+sample_weights = class_weights[labels]
+print("class weights:", class_weights.round(decimals=3).tolist())
+print("effective sampling probability:",
+      (class_weights / class_weights.sum()).round(decimals=3).tolist())
+```
+
+$\beta=0$ 是均匀采样，$\beta=1$ 是完全按逆频率采样。中间值在“提升稀有类”和“保持头部类性能”之间折中。采样后要重新估计每个 epoch 的有效样本数，并监控头部类是否退化。
+
+## 22.7 合成数据
+
+合成数据的价值在于覆盖真实数据难以采集的场景：极端天气、罕见事故、危险工况。它的风险是域差距：渲染的光照、材质、噪声分布与真实传感器不同，模型可能学到渲染器的伪影。
+
+实践建议：
+
+- 合成数据只用于训练，评估必须在真实数据上；
+- 控制合成/真实比例，做消融而不是一次性全量替换；
+- 随机化光照、材质、相机参数、天气，避免模型记住固定模式；
+- 检查合成数据的标注是否与真实标注规范一致；
+- 用真实数据上的失败样本反推合成数据的覆盖缺口。
+
+## 22.8 版本化与 datasheet
+
+数据集版本化的最小要求是：任何一次训练都能追溯到确切的数据快照。常见做法：
+
+- 用内容哈希生成 manifest：路径、大小、SHA-256、标签版本；
+- 用 DVC、LakeFS 或对象存储版本管理大文件；
+- 训练配置里记录数据版本，而不是只写路径；
+- 划分文件单独版本化，禁止每次运行时随机重新划分。
+
+```{python}
+#| label: manifest
+import hashlib
+
+
+def file_digest(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+files = {
+    "images/0001.jpg": b"fake-jpeg-bytes-1",
+    "images/0002.jpg": b"fake-jpeg-bytes-2",
+    "labels/0001.txt": b"0 0.5 0.5 0.2 0.2",
+}
+manifest = {path: file_digest(content)[:12] for path, content in sorted(files.items())}
+combined = hashlib.sha256("".join(manifest.values()).encode()).hexdigest()[:12]
+print(manifest)
+print("dataset fingerprint:", combined)
+```
+
+datasheet 是数据集的“说明书”，至少应包含：动机、组成、采集过程、预处理、标注规范、分布统计、划分方式、已知偏差、许可、维护方式。它不是形式主义：当模型在某个群体上表现差时，datasheet 能帮你快速判断是数据覆盖问题还是模型问题。
+
+## 22.9 数据泄漏
+
+数据泄漏是离线指标虚高的头号原因：
+
+- **近重复泄漏**：同一张图的不同裁剪分别进了训练和验证；
+- **场景泄漏**：同一段视频的相邻帧被随机分到不同 split；
+- **时间泄漏**：用未来数据预测过去；
+- **标注泄漏**：验证集的标签以文件名、目录名或元数据形式出现在训练特征里；
+- **预处理泄漏**：在划分前用全量数据计算归一化统计量或拟合 PCA。
+
+防泄漏的核心是**按组划分**：以场景、视频、患者、采集批次为单位划分，而不是以单张图为单位。划分后要做近重复检查，确认训练集和验证集没有高相似样本。
+
+## 22.10 工程坑
+
+::: {.callout-warning}
+## 数据工程的常见失败
+
+- **先划分再去重**：重复图跨 split，指标虚高。
+- **只去精确重复**：裁剪、亮度变化后的近重复仍然泄漏。
+- **标注规范没有边界案例**：标注员各自理解，kappa 很低。
+- **抽检只抽简单样本**：稀有类和困难场景的质量无人知道。
+- **长尾重采样后不重估指标**：训练分布变了，验证分布没变，阈值失效。
+- **合成数据比例过大**：模型学到渲染伪影，真实场景反而下降。
+- **数据版本只写路径**：同一路径内容变了，实验无法复现。
+:::
+
+## 22.11 小结
+
+- 数据工程的目标是可追溯、可复现、可审计，而不只是“更多数据”。
+- 去重要覆盖精确、近重复和语义重复；感知哈希是低成本的近重复工具。
+- 标注规范必须包含边界案例，用 kappa 等指标监控一致性。
+- 长尾处理要在重采样、损失加权和分层划分之间做组合，并监控头部类退化。
+- 合成数据只能用于训练，评估必须在真实数据上。
+- 按组划分和近重复检查是防止数据泄漏的两道基本防线。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+1. 用 dHash 在 100 张图上做近重复聚类，比较阈值 5、10、15 的结果。
+2. 给一个三分类任务写 Cohen's kappa 计算，并解释为什么一致率高不代表 kappa 高。
+3. 设计一个长尾采样器，使每个类别在一个 epoch 中至少出现 10 次。
+4. 为一个小型检测数据集写 datasheet 模板，至少包含 10 个字段。
+5. 构造一个“同一视频相邻帧跨 split”的泄漏例子，设计按组划分方案。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- Gebru et al., *Datasheets for Datasets*, 2021.
+- Sambasivan et al., *“Everyone wants to do the model work, not the data work”*, 2021.
+- Lin et al., *Microsoft COCO: Common Objects in Context*, 2014. [@lin2014coco]
+- Everingham et al., *The PASCAL Visual Object Classes Challenge*, 2010. [@everingham2010voc]
