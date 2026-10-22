@@ -5,36 +5,225 @@ title: "第 16 章 实例分割与提示分割"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
 - 前置：第 15 章
-- 预计篇幅：待定
+- 预计阅读：75 分钟
+- 算力：CPU 可完成指标与后处理实验；SAM/SAM2 推理建议单卡 12 GB 以上
 :::
 
-## 学习目标
+语义分割告诉你“这里是人”，实例分割还要区分“这是第一个人、第二个人”。在拥挤场景里，这个区别决定了模型能不能数清人数、能不能把每个行人的掩码分别交给跟踪器。
 
-- 理解实例分割与语义分割的任务差异
-- 掌握 Mask R-CNN、Mask2Former 的核心机制
-- 能用 SAM/SAM2 做提示分割与下游微调
+提示分割（promptable segmentation）把问题又往前推了一步：模型不再固定输出预定义类别，而是根据点、框或掩码提示，分割“你指的那个东西”。SAM 让交互式标注的成本大幅下降，但它不是万能的语义理解器。这一章讲清实例分割的三代思路，以及提示分割在标注流水线里的正确位置。
 
-## 内容规划
+## 16.1 三种分割任务
 
-- Mask R-CNN 与 RoI Align
-- Mask2Former 与掩码注意力
-- SAM/SAM2 的 prompt 接口
-- zero-shot 分割与自动掩码
-- 交互式标注与下游微调
+| 任务 | 输出 | 是否区分实例 | 典型数据 |
+|---|---|---|---|
+| 语义分割 | 每像素一个类别 | 否 | Cityscapes、ADE20K |
+| 实例分割 | 每个目标一个掩码 + 类别 | 是 | COCO |
+| 全景分割 | 每像素一个类别 + 实例 id | 是（可数物体） | COCO Panoptic、Cityscapes |
 
-## 动手
+实例分割的掩码通常是二值图，同一像素只属于一个实例。全景分割把“可数物体”（人、车）和“不可数区域”（天空、道路）统一起来：前者区分实例，后者只标类别。
 
-用 point/box prompt 做交互式分割，并微调一个小分割头完成特定类别任务。
+评估实例分割用 mask AP：把预测掩码与 GT 掩码的 IoU 作为匹配依据，套用第 13 章的 AP 流程。注意不是框 IoU；框对了但掩码破碎，mask AP 会很低。
+
+## 16.2 Mask R-CNN：在检测器上加一个掩码分支
+
+Mask R-CNN 的结构可以概括为“Faster R-CNN + 掩码分支”：
+
+1. 骨干 + FPN 提取多尺度特征；
+2. RPN 生成候选框；
+3. RoI Align 从特征图上裁出固定大小的区域；
+4. 分类头、框回归头、掩码头并行计算。
+
+掩码头对每个 RoI 输出 $K \times 28 \times 28$ 的掩码，$K$ 是类别数。训练时只对 GT 类别对应的那个通道计算损失，推理时也只取预测类别对应的通道。这个设计把掩码生成与分类解耦：掩码分支不需要判断类别，只负责“在这个框里，目标的形状是什么”。
+
+掩码损失通常是逐像素二元交叉熵，配合 RoI Align 的双线性采样，梯度可以传到浮点坐标。相比语义分割的 softmax + CE，这里每个类别通道独立做 sigmoid，允许不同实例掩码在空间上重叠（训练时），推理后再按分数和 NMS 处理。
+
+Mask R-CNN 的失败模式：
+
+- 小目标的 28×28 掩码是从很小的 RoI 上采样来的，边界天然模糊；
+- 高度重叠的同类实例，NMS 可能把其中一个压掉；
+- 掩码分支的感受野有限，细长结构容易断。
+
+## 16.3 Mask2Former：查询驱动的统一分割
+
+Mask2Former 把语义、实例、全景分割统一成“掩码分类”：用 $N$ 个查询（query）分别预测一个掩码和一个类别，训练时用匈牙利匹配把查询分配给 GT。
+
+它的核心是掩码注意力（masked attention）：每个查询不是对全图做注意力，而是只在上一轮预测的掩码区域内做交叉注意力。这样计算量随掩码面积而不是全图分辨率增长，也迫使查询关注自己的区域。
+
+与 Mask R-CNN 的差别：
+
+| 维度 | Mask R-CNN | Mask2Former |
+|---|---|---|
+| 候选来源 | RPN + anchor | 可学习查询 |
+| 掩码分辨率 | 固定 28×28 | 高分辨率特征逐级上采样 |
+| 后处理 | NMS | 查询去重，通常无需 NMS |
+| 任务统一 | 实例分割 | 语义/实例/全景统一 |
+
+Mask2Former 的查询去重仍可能留下重复掩码，尤其在同质区域。实际部署时常用 mask NMS 或按分数截断作为保险。
+
+## 16.4 SAM：用提示分割一切
+
+SAM（Segment Anything Model）由三部分组成：
+
+- **图像编码器**：ViT，把图像编码成特征图；
+- **提示编码器**：把点、框、掩码编码成 token；
+- **掩码解码器**：轻量 Transformer，融合图像特征与提示，输出多个候选掩码。
+
+点提示分正点和负点：正点表示“要这个位置”，负点表示“不要这个位置”。框提示给出目标范围，通常比单点更稳定。掩码提示可以用于迭代修正：把上一轮掩码作为输入，再补一个点。
+
+```{python}
+#| label: sam-inference
+#| eval: false
+import numpy as np
+from segment_anything import SamPredictor, sam_model_registry
+
+sam = sam_model_registry["vit_h"](checkpoint="sam_vit_h_4b8939.pth")
+sam.to(device="cuda")
+predictor = SamPredictor(sam)
+predictor.set_image(np.asarray(image))  # RGB uint8, H x W x 3
+
+masks, scores, logits = predictor.predict(
+    point_coords=np.array([[500, 375], [1125, 625]]),
+    point_labels=np.array([1, 0]),  # 1 正点，0 负点
+    multimask_output=True,
+)
+best = masks[scores.argmax()]
+print(best.shape, scores)
+```
+
+`set_image` 的图像编码只做一次，之后可以用不同提示反复查询。交互式标注工具正是利用这一点：用户点几下，模型给出候选掩码，用户再修正。
+
+SAM 的能力边界必须说清：
+
+- 它做的是**类无关**分割，不知道“猫”和“狗”的语义，只区分“这个物体”和“背景”；
+- 对极细结构（电线、栅栏）、低对比度边界和严重遮挡，掩码会断；
+- 自动掩码生成会产生大量碎片，需要按面积、稳定性和重复度过滤；
+- 文本提示不是原生能力，Grounding DINO + SAM 这类组合才能做开放词汇分割。
+
+## 16.5 SAM2 与视频提示分割
+
+SAM2 把图像扩展到视频：给定第一帧的提示，模型在后续帧中传播掩码。它引入记忆机制，把历史帧的特征和掩码存起来，当前帧通过记忆注意力读取。
+
+工程上要注意：
+
+- 视频解码和内存带宽往往比模型计算更早成为瓶颈；
+- 长视频需要分块处理，块与块之间的掩码要重新初始化，避免漂移；
+- 目标消失后重新出现，传播可能失败，需要检测器或人工重新给提示；
+- 多目标同时跟踪时，每个目标独立维护记忆，显存随目标数增长。
+
+## 16.6 掩码后处理与质量评估
+
+实例分割的输出是若干二值掩码。合并、去重和评估都依赖掩码 IoU：
+
+```{python}
+#| label: mask-iou
+import torch
+
+
+def mask_iou(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    pred = pred.flatten(1).float()
+    target = target.flatten(1).float()
+    intersection = pred @ target.T
+    union = pred.sum(1)[:, None] + target.sum(1)[None, :] - intersection
+    return intersection / union.clamp(min=eps)
+
+
+pred_masks = torch.tensor([
+    [[1, 1, 0], [1, 0, 0], [0, 0, 0]],
+    [[0, 0, 0], [0, 1, 1], [0, 1, 1]],
+], dtype=torch.bool)
+gt_masks = torch.tensor([
+    [[1, 1, 0], [0, 1, 0], [0, 0, 0]],
+    [[0, 0, 0], [0, 1, 1], [0, 1, 0]],
+], dtype=torch.bool)
+print(mask_iou(pred_masks, gt_masks).round(decimals=3))
+print("areas:", pred_masks.flatten(1).sum(1).tolist())
+```
+
+第一个实例的 IoU 是 0.5，第二个是 0.75。掩码 IoU 对边界非常敏感：一个 100×100 的目标，边界错一圈就可能掉 5–10 个点。
+
+自动标注流水线的质量检查通常包含：
+
+- 面积异常：过小（碎片）或过大（吞并背景）；
+- 稳定性：对输入加轻微扰动，掩码 IoU 是否保持；
+- 重复度：与已有掩码的 IoU 是否超过阈值；
+- 边界贴合：用 trimap 或边界带评估；
+- 人工抽检：按类别和难度分层抽样，而不是随机抽。
+
+::: {.callout-tip}
+## 用 SAM 做标注的正确姿势
+
+把 SAM 当成“掩码生成器”，不要当成“标注真值”。先用检测器或文本提示给出候选框，再用 SAM 细化；人工只做接受/修正，而不是从零画。每批数据保留 5%–10% 的人工复核，并记录修正率；修正率突然上升，通常意味着数据域发生了变化。
+:::
+
+## 16.7 微调提示分割模型
+
+SAM 的图像编码器很大，全量微调成本高。常见做法是冻结图像编码器，只训练掩码解码器或加 LoRA：
+
+```{python}
+#| label: sam-finetune
+#| eval: false
+for p in sam.image_encoder.parameters():
+    p.requires_grad = False
+for p in sam.mask_decoder.parameters():
+    p.requires_grad = True
+
+optimizer = torch.optim.AdamW(
+    [p for p in sam.parameters() if p.requires_grad], lr=1e-4, weight_decay=0.01
+)
+
+for image, gt_mask, prompt in loader:
+    image_embedding = sam.image_encoder(image)
+    pred_mask, iou_pred = sam.mask_decoder(
+        image_embeddings=image_embedding,
+        image_pe=sam.prompt_encoder.get_dense_pe(),
+        sparse_prompt_embeddings=sparse_embeddings,
+        dense_prompt_embeddings=dense_embeddings,
+        multimask_output=False,
+    )
+    loss = seg_loss(pred_mask, gt_mask)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+微调数据不需要全图掩码，只需要目标区域的提示和对应掩码。医学、遥感等域外数据上，冻结编码器 + 微调解码器通常已经足够；如果域差距很大，再考虑解冻最后几层或加 LoRA。
+
+## 16.8 工程坑
+
+::: {.callout-warning}
+## 实例与提示分割的常见问题
+
+- **把语义分割指标套到实例分割上**：实例数、重叠和匹配规则都不同，mIoU 不能替代 mask AP。
+- **掩码 resize 用双线性**：阈值化后边界抖动，应使用最近邻或在对数几率上插值。
+- **SAM 自动掩码不去重**：同一目标生成多个嵌套掩码，标注集被污染。
+- **正负点泄漏**：负点落在目标内部，模型学到错误边界；交互工具要限制点的位置。
+- **忽略空掩码**：没有目标的提示也应参与训练，否则模型学会“总有东西”。
+- **视频传播不重置**：长序列漂移累积，最后掩码跑到背景上。
+:::
+
+## 16.9 小结
+
+- 语义分割不区分实例，实例分割要区分，全景分割统一两者。
+- Mask R-CNN 用 RoI Align + 独立掩码分支，把检测框细化成掩码。
+- Mask2Former 用查询和掩码注意力统一三种分割任务，减少后处理。
+- SAM 是类无关的提示分割器，适合交互式标注和掩码生成，不提供语义类别。
+- 掩码 IoU 是后处理、去重和评估的共同基础；自动标注必须有人工抽检闭环。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+1. 实现 mask NMS：按分数排序，抑制与已保留掩码 IoU 超过阈值的候选。
+2. 用 16.6 的 `mask_iou` 计算 mask AP 的匹配步骤，并说明与框 AP 的差异。
+3. 设计一个自动掩码过滤规则，同时考虑面积、稳定性和重复度。
+4. 比较“点提示”“框提示”“点 + 框”三种方式在遮挡目标上的掩码质量。
+5. 写一份 SAM 辅助标注的质检清单，至少包含五项可量化指标。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- He et al., *Mask R-CNN*, 2017. [@he2017maskrcnn]
+- Kirillov et al., *Segment Anything*, 2023. [@kirillov2023sam]
+- Ravi et al., *SAM 2: Segment Anything in Images and Videos*, 2025. [@ravi2024sam2]
+- Cheng et al., *Masked-attention Mask Transformer for Universal Image Segmentation*, 2022.

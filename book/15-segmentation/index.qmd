@@ -5,36 +5,294 @@ title: "第 15 章 语义分割"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
 - 前置：第 7、8 章
-- 预计篇幅：待定
+- 预计阅读：80 分钟
+- 算力：CPU 可完成结构与指标实验；U-Net 训练建议单卡 8 GB
 :::
 
-## 学习目标
+语义分割要给每个像素分配一个类别。它比检测更“细”，也更残酷：检测框偏几个像素通常不影响 IoU 阈值判定，分割却会在边界、细结构和类别交界处直接暴露问题。
 
-- 理解 FCN、U-Net、DeepLab 的结构演进
-- 掌握分割损失、mIoU 与类别不均衡处理
-- 能定位边界错误与小目标失败
+一个常见的上线事故是：模型在道路、天空、建筑上 mIoU 很高，但电线杆、护栏、行人腿部这些细长结构几乎全断。原因是总体 mIoU 被大面积类别主导，而小目标类别的 IoU 被平均掉了。这一章从结构、损失和指标三个角度解释这个现象，并给出可运行的实现。
 
-## 内容规划
+## 15.1 从图像分类到逐像素分类
 
-- 转置卷积与上采样
-- FCN、U-Net
-- 空洞卷积、ASPP、DeepLab
-- CE/Dice/Focal 与类别不均衡
-- mIoU、混淆矩阵与边界误差
+分类模型输出 `(N, C)`，分割模型输出 `(N, C, H, W)`，其中每个空间位置是一个 C 类分布。推理时对通道维取 `argmax`，得到 `(N, H, W)` 的类别图。
 
-## 动手
+如果直接在原分辨率上做卷积，显存和计算量都无法接受。标准做法是编码器逐步下采样，把分辨率降低 8–32 倍，再通过解码器恢复到原图。下采样扩大感受野，解码器恢复空间细节，二者之间的跳跃连接（skip connection）把浅层的高分辨率特征送回来。
 
-在 Oxford-IIIT Pet/VOC 子集训练 U-Net，输出混淆矩阵与边界错误可视化。
+分割的另一个难点是类别不均衡。城市街景中道路和天空可能占 50% 以上像素，而交通标志不到 1%。如果用普通交叉熵，模型只要把所有像素预测成道路就能得到很低的损失。
+
+## 15.2 转置卷积与解码器
+
+转置卷积（transposed convolution）常被误称为“反卷积”。它不是卷积的逆运算，而是一种可学习的上采样：先在高分辨率网格上插入零，再用卷积核填充。
+
+输出尺寸公式与卷积对称：
+
+$$
+H_{out} = (H_{in} - 1)S - 2P + D(K - 1) + 1
+$$
+
+```{python}
+#| label: transposed-conv
+import torch
+from torch import nn
+
+upsample = nn.ConvTranspose2d(3, 3, kernel_size=4, stride=2, padding=1)
+x = torch.randn(1, 3, 8, 8)
+print("input:", tuple(x.shape))
+print("output:", tuple(upsample(x).shape))
+
+same_size = nn.ConvTranspose2d(3, 3, kernel_size=3, stride=2, padding=1, output_padding=1)
+print("with output_padding:", tuple(same_size(x).shape))
+```
+
+转置卷积有两个问题：计算量随通道数平方增长；卷积核重叠不均匀时会产生棋盘格伪影（checkerboard artifact）。现代分割网络更常用“最近邻/双线性插值 + 普通卷积”做上采样，稳定且更容易控制。
+
+U-Net 的结构是“编码器—瓶颈—解码器”，每一级解码都拼接同分辨率的编码特征：
+
+```{python}
+#| label: unet
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class TinyUNet(nn.Module):
+    def __init__(self, in_channels: int = 3, num_classes: int = 5,
+                 base_channels: int = 16) -> None:
+        super().__init__()
+        c = base_channels
+        self.enc1 = DoubleConv(in_channels, c)
+        self.enc2 = DoubleConv(c, c * 2)
+        self.enc3 = DoubleConv(c * 2, c * 4)
+        self.bottleneck = DoubleConv(c * 4, c * 8)
+        self.up3 = nn.ConvTranspose2d(c * 8, c * 4, 2, stride=2)
+        self.dec3 = DoubleConv(c * 8, c * 4)
+        self.up2 = nn.ConvTranspose2d(c * 4, c * 2, 2, stride=2)
+        self.dec2 = DoubleConv(c * 4, c * 2)
+        self.up1 = nn.ConvTranspose2d(c * 2, c, 2, stride=2)
+        self.dec1 = DoubleConv(c * 2, c)
+        self.head = nn.Conv2d(c, num_classes, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(F.max_pool2d(e1, 2))
+        e3 = self.enc3(F.max_pool2d(e2, 2))
+        b = self.bottleneck(F.max_pool2d(e3, 2))
+        d3 = self.dec3(torch.cat([self.up3(b), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        return self.head(d1)
+
+
+model = TinyUNet(num_classes=5)
+x = torch.randn(2, 3, 128, 128)
+logits = model(x)
+print("logits:", tuple(logits.shape))
+print("parameters:", sum(p.numel() for p in model.parameters()))
+```
+
+跳跃连接不是装饰。编码器最后一层虽然语义强，但空间分辨率只有原图的 1/8，直接上采样会丢失边界；浅层特征分辨率高、语义弱，拼接后由卷积学习如何融合。消融时去掉 skip connection，边界指标通常先崩。
+
+## 15.3 损失函数：CE、Dice 与 Focal
+
+交叉熵逐像素独立计算，训练稳定，但对类别不均衡无感。Dice 损失直接优化预测与 GT 的重叠：
+
+$$
+\mathcal{L}_{\mathrm{Dice}} = 1 - \frac{2 \sum_i p_i g_i + \epsilon}{\sum_i p_i + \sum_i g_i + \epsilon}
+$$
+
+其中 $p_i$ 是像素 $i$ 属于前景的预测概率，$g_i$ 是 GT。Dice 对小目标更敏感，但梯度在预测接近空时不稳定。
+
+```{python}
+#| label: seg-loss
+import torch
+import torch.nn.functional as F
+
+
+def dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    num_classes = logits.shape[1]
+    prob = logits.softmax(dim=1)
+    one_hot = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
+    dims = (0, 2, 3)
+    intersection = (prob * one_hot).sum(dims)
+    union = prob.sum(dims) + one_hot.sum(dims)
+    dice = (2 * intersection + eps) / (union + eps)
+    return 1 - dice.mean()
+
+
+torch.manual_seed(0)
+logits = torch.randn(2, 3, 16, 16)
+target = torch.randint(0, 3, (2, 16, 16))
+ce = F.cross_entropy(logits, target)
+dice = dice_loss(logits, target)
+print(f"CE: {ce.item():.4f}, Dice: {dice.item():.4f}")
+print(f"CE + Dice: {(ce + dice).item():.4f}")
+```
+
+组合损失在医学影像和遥感中很常见：CE 提供稳定的逐像素梯度，Dice 负责拉高小目标的重叠。权重不必设为 1:1，通常先让 CE 主导，再逐步增加 Dice。
+
+Focal Loss 也可以用于分割，把每个像素当成二分类/多分类样本。它对难分像素加权，但会进一步放大噪声标注的影响；如果标签边界本身不准，Focal 往往适得其反。
+
+## 15.4 指标：从混淆矩阵到 mIoU
+
+语义分割的标准指标是 mIoU（mean intersection over union）：先对每个类别算 IoU，再对类别取平均。IoU 的分子是预测为该类且 GT 也为该类的像素数，分母是“预测为该类”与“GT 为该类”的并集。
+
+```{python}
+#| label: miou
+import torch
+
+
+def confusion_matrix(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    ignore_index: int = 255,
+) -> torch.Tensor:
+    mask = target != ignore_index
+    indices = target[mask] * num_classes + pred[mask]
+    return torch.bincount(indices, minlength=num_classes**2).reshape(num_classes, num_classes)
+
+
+def per_class_iou(confusion: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor]:
+    tp = confusion.diag()
+    support = confusion.sum(dim=1)
+    predicted = confusion.sum(dim=0)
+    iou = tp / (support + predicted - tp).clamp(min=eps)
+    return iou, support
+
+
+pred = torch.tensor([0, 0, 1, 1, 2, 2, 2, 0])
+target = torch.tensor([0, 1, 1, 1, 2, 0, 2, 0])
+confusion = confusion_matrix(pred, target, num_classes=3)
+iou, support = per_class_iou(confusion)
+print("confusion (rows=GT, cols=pred):\n", confusion)
+print("IoU:", iou.round(decimals=3).tolist())
+print("mIoU:", round(iou.mean().item(), 3))
+```
+
+这个例子里，类别 0 的 IoU 是 0.5，类别 1 和类别 2 都是 0.667，mIoU 约 0.611。注意 `confusion_matrix` 的行是 GT、列是预测，写反了会得到不同的每类 IoU，虽然对角线之和不变。
+
+报告 mIoU 时必须同时给出：
+
+- 每个类别的 IoU 与像素占比；
+- 是否包含背景类；
+- ignore 区域如何处理；
+- 是否做了多尺度/翻转测试时增强。
+
+只报一个 mIoU，无法判断模型是“整体都好”还是“大面积类别拉高了平均”。
+
+边界质量需要单独看。常用指标有 Boundary IoU 和 trimap IoU：只在 GT 边界附近一个窄带内计算 IoU，能暴露细结构断裂，而总体 mIoU 可能完全看不出来。
+
+## 15.5 数据与增强
+
+分割标注通常是单通道索引图，像素值就是类别 id。几个必须检查的点：
+
+- 类别 id 是否从 0 连续编号；`255` 是否用于 ignore；
+- 图像 resize 是否用双线性，mask 必须用最近邻；
+- 翻转、旋转、裁剪的参数必须同时作用于图像和 mask；
+- 颜色抖动只能用于图像，不能用于 mask。
+
+```{python}
+#| label: sync-augment
+import torch
+import torch.nn.functional as F
+
+
+def random_crop_pair(image: torch.Tensor, mask: torch.Tensor,
+                     size: int, generator: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
+    _, h, w = image.shape
+    top = torch.randint(0, h - size + 1, (1,), generator=generator).item()
+    left = torch.randint(0, w - size + 1, (1,), generator=generator).item()
+    return image[:, top:top + size, left:left + size], mask[top:top + size, left:left + size]
+
+
+def random_flip_pair(image: torch.Tensor, mask: torch.Tensor,
+                     generator: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
+    if torch.rand(1, generator=generator).item() < 0.5:
+        return image.flip(-1), mask.flip(-1)
+    return image, mask
+
+
+generator = torch.Generator().manual_seed(0)
+image = torch.rand(3, 128, 128)
+mask = torch.randint(0, 5, (128, 128))
+image_crop, mask_crop = random_crop_pair(image, mask, 96, generator)
+image_flip, mask_flip = random_flip_pair(image_crop, mask_crop, generator)
+print("image:", tuple(image_flip.shape), "mask:", tuple(mask_flip.shape))
+```
+
+resize 是最高频的错误来源。图像用双线性插值后，mask 如果也跟着双线性插值，会出现 0.5、1.5 这样的类别值；转成 `long` 时被截断，边界标签悄悄错位。正确做法是 `F.interpolate(mask.float().unsqueeze(1), mode="nearest").squeeze(1).long()`。
+
+## 15.6 训练与推理
+
+一个可复现的语义分割基线：
+
+| 项目 | 设置 |
+|---|---|
+| 模型 | U-Net + ResNet-34 预训练编码器 |
+| 输入 | 512×512 随机裁剪 |
+| 损失 | CE + Dice，ignore_index=255 |
+| 优化器 | AdamW，lr=1e-4，weight_decay=1e-4 |
+| 调度 | 多项式衰减，power=0.9 |
+| batch size | 8 |
+| 训练轮数 | 40–80 |
+| 指标 | mIoU + 每类 IoU + Boundary IoU |
+
+训练时建议先在小分辨率上跑通，再提升到最终分辨率。分割的显存主要被高分辨率特征图占据，输入从 256 提到 512，激活显存约变为 4 倍；如果显存不够，优先减 batch 或使用梯度累积，而不是盲目换更小的模型。
+
+推理时常见的测试时增强是水平翻转 + 多尺度。翻转要把 logits 翻回来再平均；多尺度要把 logits 插值回原尺寸再平均，不能在 argmax 之后平均类别 id。
+
+## 15.7 工程坑
+
+::: {.callout-warning}
+## 分割任务的常见失败
+
+- **mask 被双线性插值**：出现非整数类别，边界标签错位。
+- **忽略 ignore_index**：`255` 被当成第 255 类，混淆矩阵越界或指标虚高。
+- **类别 id 不连续**：`num_classes` 设小了会截断，设大了会拉低 mIoU。
+- **只报总体 mIoU**：大面积类别掩盖小目标崩溃。
+- **训练/推理 resize 不一致**：训练随机裁剪，推理整图缩放，边界分布偏移。
+- **在 argmax 后做 TTA**：类别 id 平均没有意义，必须对概率或 logits 平均。
+:::
+
+## 15.8 小结
+
+- 分割模型输出逐像素类别分布，编码器降分辨率、解码器恢复细节，skip connection 保留边界信息。
+- 转置卷积可以学习上采样，但有棋盘格伪影；插值 + 卷积更常用。
+- CE 稳定但对不均衡无感，Dice 对小目标敏感但梯度不稳，组合使用更常见。
+- mIoU 要按类别报告，并单独检查边界和小目标。
+- 图像与 mask 的增强必须同步，mask 只能做最近邻几何变换。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+1. 去掉 TinyUNet 的 skip connection，比较参数量、训练损失和边界 IoU。
+2. 用纯 Dice、纯 CE、CE+Dice 三种损失训练同一模型，比较小目标类别的 IoU。
+3. 实现 Boundary IoU，并在 15.4 的 toy 例子上验证它与普通 IoU 的差异。
+4. 写一个正确的 `resize_pair`，确保 mask 使用最近邻且 ignore 值不被改变。
+5. 比较“logits 平均后 argmax”和“各类别概率平均后 argmax”的 TTA 结果差异。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- Long et al., *Fully Convolutional Networks for Semantic Segmentation*, 2015.
+- Ronneberger et al., *U-Net: Convolutional Networks for Biomedical Image Segmentation*, 2015. [@ronneberger2015unet]
+- Chen et al., *Encoder-Decoder with Atrous Separable Convolution for Semantic Image Segmentation*, 2018. [@chen2018deeplabv3plus]
+- Everingham et al., *The PASCAL Visual Object Classes Challenge*, 2010. [@everingham2010voc]
