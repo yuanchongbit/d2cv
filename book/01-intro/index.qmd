@@ -5,7 +5,7 @@ title: "第 1 章 导论：计算机视觉的任务地图"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-writing">写作中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
 - 前置：无
 - 预计阅读：30 分钟

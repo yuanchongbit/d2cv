@@ -5,36 +5,267 @@ title: "第 6 章 从线性分类器到多层感知机"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
-- 前置：第 2 章
-- 预计篇幅：待定
+- 前置：第 3 章
+- 预计阅读：65 分钟
+- 算力：CPU
 :::
 
-## 学习目标
+在卷积网络之前，先退一步：如果把图像展平成一个向量，最小的分类器长什么样？它为什么不够？多层感知机（multilayer perceptron, MLP）补上了哪块能力，又留下了什么问题？
 
-- 理解 softmax、交叉熵与决策边界
-- 从零实现线性分类器和 MLP 训练循环
-- 识别过拟合、欠拟合与正则化的信号
+本章用二维玩具数据把决策边界画出来，再回到图像，算清楚参数量。理解这些，才能判断一个模型是真的需要卷积，还是只是参数堆得不够。
 
-## 内容规划
+## 6.1 线性分类器
 
-- 图像展平与线性分类器
-- softmax、交叉熵与梯度
-- MLP、激活函数与初始化
-- 过拟合、权重衰减与早停
-- 决策边界与错误样本可视化
+给定输入 `x ∈ R^D` 和 `C` 个类别，线性分类器计算：
 
-## 动手
+$$
+\mathbf{z} = \mathbf{W}\mathbf{x} + \mathbf{b}, \quad \mathbf{W}\in\mathbb{R}^{C\times D}.
+$$
 
-在 Fashion-MNIST/CIFAR-10 上从零训练线性分类器和 MLP。
+`z` 是 logits，经过 softmax 变成概率：
+
+$$
+p_c = \frac{\exp(z_c)}{\sum_{j=1}^{C}\exp(z_j)}.
+$$
+
+训练目标是最小化负对数似然（交叉熵）：
+
+$$
+\mathcal{L} = -\log p_y = -z_y + \log\sum_j \exp(z_j).
+$$
+
+线性分类器的决策边界是超平面。对于二维输入，它就是一条直线；对于图像，它是高维空间里的一个平面。它只能解决线性可分问题。
+
+### 数值稳定性
+
+直接计算 `exp(z)` 会溢出。标准做法是先减去最大值：
+
+```{python}
+#| label: softmax
+import torch
+import torch.nn.functional as F
+
+logits = torch.tensor([[1000.0, 1001.0, 1002.0], [0.1, -0.2, 0.3]])
+naive = torch.exp(logits) / torch.exp(logits).sum(dim=1, keepdim=True)
+stable = torch.softmax(logits, dim=1)
+
+target = torch.tensor([2, 0])
+loss_manual = -(stable[torch.arange(2), target].log()).mean()
+loss_torch = F.cross_entropy(logits, target)
+
+print("naive softmax:", naive)
+print("stable softmax:", stable)
+print("manual CE:", loss_manual.item(), "| torch CE:", loss_torch.item())
+```
+
+`torch.softmax` 内部做了减最大值的处理。自己实现时如果忘了这一步，训练初期可能直接得到 `nan`。
+
+## 6.2 一个二维分类问题
+
+构造两个交错的“月牙”：
+
+```{python}
+#| label: make-moons
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+
+def make_moons(n: int = 500, noise: float = 0.18, seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    rng = np.random.default_rng(seed)
+    n_out = n // 2
+    n_in = n - n_out
+    theta_out = rng.uniform(0, np.pi, n_out)
+    theta_in = rng.uniform(0, np.pi, n_in)
+    outer = np.stack([np.cos(theta_out), np.sin(theta_out)], axis=1)
+    inner = np.stack([1 - np.cos(theta_in), 0.5 - np.sin(theta_in)], axis=1)
+    x = np.concatenate([outer, inner], axis=0) + rng.normal(0, noise, size=(n, 2))
+    y = np.concatenate([np.zeros(n_out), np.ones(n_in)]).astype(np.int64)
+    return torch.from_numpy(x).float(), torch.from_numpy(y)
+
+
+x, y = make_moons()
+print("x:", x.shape, "y:", y.shape, "class balance:", y.bincount().tolist())
+
+plt.figure(figsize=(5, 4))
+plt.scatter(x[y == 0, 0], x[y == 0, 1], s=12, label="class 0", alpha=0.7)
+plt.scatter(x[y == 1, 0], x[y == 1, 1], s=12, label="class 1", alpha=0.7)
+plt.legend(frameon=False)
+plt.gca().set_aspect("equal")
+plt.tight_layout()
+```
+
+这个数据集线性不可分。任何一条直线都会同时切到两类。
+
+## 6.3 训练线性分类器和 MLP
+
+```{python}
+#| label: models
+from torch import nn
+
+
+class LinearClassifier(nn.Module):
+    def __init__(self, in_dim: int = 2, num_classes: int = 2) -> None:
+        super().__init__()
+        self.linear = nn.Linear(in_dim, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+
+class MLP(nn.Module):
+    def __init__(self, in_dim: int = 2, hidden: int = 64, num_classes: int = 2) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def train(model: nn.Module, x: torch.Tensor, y: torch.Tensor, weight_decay: float = 0.0, epochs: int = 300):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.03, weight_decay=weight_decay)
+    for _ in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        loss = F.cross_entropy(model(x), y)
+        loss.backward()
+        optimizer.step()
+    model.eval()
+    with torch.inference_mode():
+        accuracy = (model(x).argmax(dim=1) == y).float().mean().item()
+    return model, accuracy
+
+
+linear, acc_linear = train(LinearClassifier(), x, y)
+mlp, acc_mlp = train(MLP(), x, y)
+mlp_wd, acc_mlp_wd = train(MLP(), x, y, weight_decay=0.1)
+print(f"linear acc: {acc_linear:.3f}")
+print(f"MLP acc: {acc_mlp:.3f}")
+print(f"MLP + weight decay acc: {acc_mlp_wd:.3f}")
+```
+
+```{python}
+#| label: fig-boundary
+#| fig-cap: "三类模型的决策边界。线性模型只能画出一条直线；MLP 学会了弯曲边界；权重衰减会让边界更平滑。"
+def plot_boundary(ax, model: nn.Module, title: str) -> None:
+    xx, yy = np.meshgrid(np.linspace(-1.8, 2.8, 250), np.linspace(-1.5, 2.0, 250))
+    grid = torch.from_numpy(np.stack([xx.ravel(), yy.ravel()], axis=1)).float()
+    with torch.inference_mode():
+        pred = model(grid).argmax(dim=1).numpy().reshape(xx.shape)
+    ax.contourf(xx, yy, pred, levels=[-0.5, 0.5, 1.5], alpha=0.18, colors=["#2563eb", "#f97316"])
+    ax.scatter(x[y == 0, 0], x[y == 0, 1], s=8, c="#2563eb", alpha=0.6)
+    ax.scatter(x[y == 1, 0], x[y == 1, 1], s=8, c="#f97316", alpha=0.6)
+    ax.set_title(title)
+    ax.set_aspect("equal")
+
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+plot_boundary(axes[0], linear, f"linear ({acc_linear:.2f})")
+plot_boundary(axes[1], mlp, f"MLP ({acc_mlp:.2f})")
+plot_boundary(axes[2], mlp_wd, f"MLP + weight decay ({acc_mlp_wd:.2f})")
+plt.tight_layout()
+```
+
+MLP 通过隐藏层和非线性激活把输入映射到新的表示空间，再在这个空间里做线性分类。没有激活函数时，多层线性变换仍然等价于一个线性变换：
+
+$$
+\mathbf{W}_2(\mathbf{W}_1\mathbf{x}) = (\mathbf{W}_2\mathbf{W}_1)\mathbf{x}.
+$$
+
+所以激活函数不是“可选装饰”，而是 MLP 表达能力的来源。
+
+### 常见激活函数
+
+| 激活 | 公式 | 特点 |
+|---|---|---|
+| ReLU | `max(0, x)` | 计算简单、稀疏、深层网络默认选择 |
+| LeakyReLU | `max(αx, x)` | 缓解负区间梯度为 0 |
+| GELU | `x·Φ(x)` | 平滑，Transformer/ViT 常用 |
+| SiLU/Swish | `x·sigmoid(x)` | 平滑，部分现代 CNN 使用 |
+| Sigmoid/Tanh | 有界、饱和 | 容易梯度消失，隐藏层较少使用 |
+
+## 6.4 回到图像：参数量的现实
+
+把 `224×224×3` 的图像展平，输入维度是 150,528。一个隐藏层 1,024 维的 MLP，仅第一层就有：
+
+```{python}
+#| label: mlp-params
+in_dim = 224 * 224 * 3
+hidden = 1024
+params = in_dim * hidden + hidden
+print(f"input dim: {in_dim:,}")
+print(f"first layer params: {params:,}")
+print(f"≈ {params * 4 / 1024**2:.1f} MiB (FP32 weights only)")
+```
+
+这还没有算反向传播的梯度和优化器状态。更关键的是，图像被展平后，相邻像素的空间关系消失了；把猫平移 3 个像素，输入向量会发生巨大变化，模型必须从数据里重新学习“平移后的猫也是猫”。
+
+卷积通过局部连接和权重共享同时解决这两个问题：
+
+- 参数不再随图像面积线性增长；
+- 同一个卷积核在整张图上滑动，天然具有平移等变性。
+
+这就是第 7 章的主题。
+
+## 6.5 过拟合与正则化
+
+在小数据上，MLP 很快就能把训练集背下来。常见手段：
+
+- **权重衰减**：在损失中加入 `λ‖W‖²`，抑制过大权重；
+- **Dropout**：训练时随机置零一部分激活，迫使表示冗余；
+- **早停**：验证集不再改善时停止；
+- **数据增强**：扩大有效数据分布；
+- **标签平滑**：避免模型对错误标签过度自信。
+
+正则化不是越多越好。权重衰减太强会导致欠拟合；Dropout 在训练早期可能拖慢收敛。第 8 章会把它们放进统一训练配方，用消融实验决定取舍。
+
+## 6.6 工程坑
+
+::: {.callout-warning}
+## 分类器训练的常见错误
+
+- **忘记 `zero_grad`**：梯度累加，等效学习率越来越大，损失剧烈震荡。
+- **softmax 后再算交叉熵**：重复做了一次 log-softmax，数值不稳定；`cross_entropy` 接收 logits。
+- **类别不平衡只看 accuracy**：全部预测多数类也能得到很高的准确率，必须看每类召回率/F1。
+- **训练集和验证集划分前做增强**：同一张图的增强副本可能同时进入两边，造成泄漏。
+- **把 `eval()` 当成可选**：Dropout/BatchNorm 在训练和推理时行为不同。
+:::
+
+## 6.7 小结
+
+- 线性分类器的决策边界是超平面，无法解决非线性问题。
+- MLP 通过隐藏层和非线性激活获得非线性表达能力。
+- 交叉熵在数值上要配合 log-sum-exp，避免指数溢出。
+- 图像展平会丢失空间结构并导致参数量爆炸，这是 CNN 的动机。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+**基础**
+
+1. 去掉 MLP 的激活函数，验证它退化为线性模型。
+2. 把隐藏层宽度从 64 改成 4，观察决策边界和准确率。
+3. 用 `F.cross_entropy` 和手写 softmax + NLL 对拍，确认数值一致。
+
+**进阶**
+
+4. 在 moons 数据上加入 30% 标签噪声，比较权重衰减和 Dropout 的抑噪效果。
+5. 实现一个三分类螺旋数据集，比较 MLP 深度对决策边界的影响。
+6. 计算一个 `224×224×3 → 512 → 256 → 10` 的 MLP 参数量，并与 ResNet-18 比较。
+
+**研究**
+
+7. 设计实验比较“展平 + MLP”和“小卷积网络”在 CIFAR-10 子集上的样本效率，控制参数量大致相同，分析归纳偏置的作用。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- [D2L：多层感知机](https://zh-v2.d2l.ai/chapter_multilayer-perceptrons/index.html)。
+- Goodfellow, Bengio and Courville, *Deep Learning*, 第 6 章。
+- Bishop, *Pattern Recognition and Machine Learning*, 第 4 章。

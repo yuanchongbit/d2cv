@@ -5,36 +5,318 @@ title: "第 3 章 图像表示、颜色与几何变换"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
-- 前置：第 2 章
-- 预计篇幅：待定
+- 前置：第 1–2 章
+- 预计阅读：60 分钟
+- 算力：CPU
 :::
 
-## 学习目标
+模型看到的不是“猫”，而是一个形状为 `(C, H, W)` 的张量。图像的通道顺序、数值范围、插值方式、坐标约定，任何一项出错，训练曲线都可能看起来“只是效果差一点”。本章把这些最底层、也最容易出错的约定讲清楚。
 
-- 理解像素、通道、色彩空间与数值范围
-- 掌握几何变换和插值的实现与坐标约定
-- 避免增强流水线中的数据/标注不同步
+## 3.1 像素、通道与数值范围
 
-## 内容规划
+一张 8 位 RGB 图像是 `uint8` 数组，形状 `(H, W, 3)`，每个通道取值 `0–255`。PyTorch 使用 `(C, H, W)` 的浮点张量，并通常归一化到 `[0, 1]` 或标准化到均值 0、方差 1。
 
-- 像素、通道、位深与图像张量
-- RGB/HSV/YCbCr 与颜色变换
-- 仿射变换、插值、resize/crop/pad
-- 增强中的坐标同步与数据泄漏
-- 从零实现双线性插值与仿射变换
+```{python}
+#| label: image-basics
+from pathlib import Path
 
-## 动手
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
 
-实现双线性 resize 与仿射变换，搭建一条带标注同步的增强流水线。
+image_path = next(
+    p for p in (Path("assets/chelsea.png"), Path("../assets/chelsea.png")) if p.exists()
+)
+pil_image = Image.open(image_path).convert("RGB")
+image_u8 = np.asarray(pil_image)
+image = image_u8.astype(np.float32) / 255.0
+
+print("PIL size (W, H):", pil_image.size)
+print("numpy shape (H, W, C):", image_u8.shape)
+print("dtype:", image_u8.dtype, "min/max:", image_u8.min(), image_u8.max())
+print("float min/max:", image.min().round(3), image.max().round(3))
+```
+
+常见的三种布局：
+
+| 布局 | 形状 | 典型来源 |
+|---|---|---|
+| HWC | `(H, W, C)` | PIL、OpenCV、matplotlib |
+| CHW | `(C, H, W)` | PyTorch 单张图像 |
+| NCHW | `(N, C, H, W)` | PyTorch batch |
+
+在数据管道里，最危险的不是不知道布局，而是**某一张图碰巧通道数相同**，错误被静默吞掉。颜色通道错位通常还能训练，但模型学到的是错误的颜色统计；到部署时，前后处理再错一次，指标会突然崩掉。
+
+::: {.callout-tip}
+## 固定你的颜色约定
+
+本书统一使用 RGB。OpenCV 默认读入 BGR，如果必须用 OpenCV，读取后立刻转换并在变量名中标注，例如 `image_bgr`。不要在同一段代码里混用两种约定。
+:::
+
+## 3.2 颜色空间：不只是换一组数
+
+RGB 适合显示，不适合直接描述“亮不亮”“什么颜色”。HSV 把颜色拆成色调（hue）、饱和度（saturation）和明度（value）；YCbCr 把亮度与色度分离，视频压缩和很多检测预处理会用到。
+
+```{python}
+#| label: fig-color
+#| fig-cap: "RGB 图像及其三个通道的直方图。蓝色通道整体偏亮，说明画面中存在明显的冷色区域。"
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.4))
+axes[0].imshow(image)
+axes[0].set_title("RGB")
+axes[0].axis("off")
+
+for channel, color in enumerate(["r", "g", "b"]):
+    axes[1].hist(
+        image[..., channel].ravel(),
+        bins=64,
+        range=(0, 1),
+        color=color,
+        alpha=0.45,
+        label=color.upper(),
+    )
+axes[1].set_title("Channel histograms")
+axes[1].set_xlabel("normalized intensity")
+axes[1].legend(frameon=False)
+plt.tight_layout()
+```
+
+从 RGB 到 HSV 的转换可以直接用公式实现。设 `maxc = max(R, G, B)`、`minc = min(R, G, B)`、`delta = maxc - minc`：
+
+$$
+H =
+\begin{cases}
+0, & \delta = 0 \\
+60^\circ \cdot \left(\frac{G-B}{\delta} \bmod 6\right), & maxc = R \\
+60^\circ \cdot \left(\frac{B-R}{\delta} + 2\right), & maxc = G \\
+60^\circ \cdot \left(\frac{R-G}{\delta} + 4\right), & maxc = B
+\end{cases}
+$$
+
+```{python}
+#| label: rgb-to-hsv
+def rgb_to_hsv(img: np.ndarray) -> np.ndarray:
+    r, g, b = img[..., 0], img[..., 1], img[..., 2]
+    maxc = img.max(axis=-1)
+    minc = img.min(axis=-1)
+    delta = maxc - minc
+
+    hue = np.zeros_like(maxc)
+    mask = delta > 1e-8
+    r_mask = mask & (maxc == r)
+    g_mask = mask & (maxc == g) & ~r_mask
+    b_mask = mask & ~(r_mask | g_mask)
+    hue[r_mask] = ((g[r_mask] - b[r_mask]) / delta[r_mask]) % 6
+    hue[g_mask] = (b[g_mask] - r[g_mask]) / delta[g_mask] + 2
+    hue[b_mask] = (r[b_mask] - g[b_mask]) / delta[b_mask] + 4
+    hue = hue * 60.0
+
+    saturation = np.where(maxc > 1e-8, delta / maxc, 0.0)
+    return np.stack([hue, saturation, maxc], axis=-1)
+
+hsv = rgb_to_hsv(image)
+print("H range:", hsv[..., 0].min().round(1), hsv[..., 0].max().round(1))
+print("S range:", hsv[..., 1].min().round(3), hsv[..., 1].max().round(3))
+print("V range:", hsv[..., 2].min().round(3), hsv[..., 2].max().round(3))
+```
+
+归一化与标准化要区分：
+
+- **归一化**（normalization）：把像素缩放到固定范围，例如 `[0, 1]` 或 `[-1, 1]`。
+- **标准化**（standardization）：减去均值、除以标准差，使用训练集统计量。
+
+ImageNet 预训练模型通常要求 `mean=(0.485, 0.456, 0.406)`、`std=(0.229, 0.224, 0.225)`。这些数字来自 ImageNet 训练集，不是“通用常数”。在自己的数据上从头训练时，可以重新统计；使用预训练权重时，必须与权重训练时一致。
+
+## 3.3 插值：resize 不是“把像素复制一遍”
+
+把图像放大或缩小时，需要在新网格上采样。最近邻最快但会产生锯齿；双线性插值用周围 4 个像素加权，是最常用的折中。
+
+给定输出坐标 `(x, y)`，先映射到输入坐标，再取左上角 `(x0, y0)` 和右下角 `(x1, y1)`：
+
+$$
+I(x, y) = (1-w_x)(1-w_y)I_{00} + w_x(1-w_y)I_{01} + (1-w_x)w_y I_{10} + w_x w_y I_{11}.
+$$
+
+```{python}
+#| label: bilinear
+def bilinear_resize(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    h, w = img.shape[:2]
+    ys = np.linspace(0, h - 1, out_h)
+    xs = np.linspace(0, w - 1, out_w)
+    y0 = np.floor(ys).astype(np.int64)
+    x0 = np.floor(xs).astype(np.int64)
+    y1 = np.minimum(y0 + 1, h - 1)
+    x1 = np.minimum(x0 + 1, w - 1)
+    wy = (ys - y0)[:, None, None]
+    wx = (xs - x0)[None, :, None]
+
+    top = img[y0][:, x0] * (1 - wx) + img[y0][:, x1] * wx
+    bottom = img[y1][:, x0] * (1 - wx) + img[y1][:, x1] * wx
+    return top * (1 - wy) + bottom * wy
+
+
+resized = bilinear_resize(image, 200, 320)
+
+import torch
+import torch.nn.functional as F
+
+ref = F.interpolate(
+    torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0),
+    size=(200, 320),
+    mode="bilinear",
+    align_corners=True,
+).squeeze(0).permute(1, 2, 0).numpy()
+print("max abs diff vs torch (align_corners=True):", np.abs(resized - ref).max())
+```
+
+自己实现的价值在于理解坐标约定。PyTorch 的 `align_corners=False`（默认）使用半像素中心映射，和上面的 `linspace(0, h-1)` 并不完全一致；PIL 也使用自己的采样约定。**训练、验证、部署必须使用同一种 resize 语义**，否则同一个框在三个环节会对不齐。
+
+## 3.4 仿射变换：用逆映射填输出
+
+旋转、缩放、平移、剪切都可以写成 $3\times3$ 齐次矩阵。工程上通常不遍历输入像素，而是遍历**输出**像素，用逆矩阵找到它在输入中的位置，这叫逆向映射（inverse mapping）。
+
+```{python}
+#| label: affine-warp
+def bilinear_sample(img: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    h, w = img.shape[:2]
+    x0 = np.floor(xs).astype(np.int64)
+    y0 = np.floor(ys).astype(np.int64)
+    x1, y1 = x0 + 1, y0 + 1
+    wx, wy = (xs - x0)[..., None], (ys - y0)[..., None]
+
+    valid = (x0 >= 0) & (y0 >= 0) & (x1 < w) & (y1 < h)
+    x0c, x1c = np.clip(x0, 0, w - 1), np.clip(x1, 0, w - 1)
+    y0c, y1c = np.clip(y0, 0, h - 1), np.clip(y1, 0, h - 1)
+
+    top = img[y0c, x0c] * (1 - wx) + img[y0c, x1c] * wx
+    bottom = img[y1c, x0c] * (1 - wx) + img[y1c, x1c] * wx
+    out = top * (1 - wy) + bottom * wy
+    return np.where(valid[..., None], out, 0.0)
+
+
+def rotate_image(img: np.ndarray, angle_deg: float) -> np.ndarray:
+    h, w = img.shape[:2]
+    theta = np.deg2rad(angle_deg)
+    cos, sin = np.cos(theta), np.sin(theta)
+    cx, cy = (w - 1) / 2, (h - 1) / 2
+
+    # 输出坐标 -> 输入坐标：先平移回原点，反向旋转，再平移回去
+    inverse = np.array(
+        [
+            [cos, sin, cx - cos * cx - sin * cy],
+            [-sin, cos, cy + sin * cx - cos * cy],
+            [0, 0, 1],
+        ]
+    )
+    yy, xx = np.mgrid[0:h, 0:w]
+    coords = np.stack([xx, yy, np.ones_like(xx)], axis=-1) @ inverse.T
+    return bilinear_sample(img, coords[..., 0], coords[..., 1])
+
+
+rotated = rotate_image(image, 25)
+
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.4))
+for ax, img, title in zip(
+    axes, [image, resized, rotated], ["original", "bilinear resize", "rotate 25°"]
+):
+    ax.imshow(img)
+    ax.set_title(title)
+    ax.axis("off")
+plt.tight_layout()
+```
+
+注意旋转后的黑边：输出坐标映射到输入图像外时，采样值被置为 0。真实增强通常还会配合裁剪或反射填充，避免把黑边当成训练信号。
+
+### 坐标同步
+
+几何增强必须同时变换图像和标注。以“裁剪 + 水平翻转”为例：
+
+```{python}
+#| label: fig-coord-sync
+#| fig-cap: "裁剪与水平翻转后，边界框坐标同步更新。框的语义没有变，但像素坐标必须跟着变。"
+box = np.array([60.0, 50.0, 390.0, 250.0])  # xyxy
+crop = (40, 20, 411, 280)  # x0, y0, x1, y1
+
+cropped_img = image[crop[1] : crop[3], crop[0] : crop[2]]
+box_crop = box.copy()
+box_crop[[0, 2]] -= crop[0]
+box_crop[[1, 3]] -= crop[1]
+box_crop[[0, 2]] = np.clip(box_crop[[0, 2]], 0, cropped_img.shape[1] - 1)
+box_crop[[1, 3]] = np.clip(box_crop[[1, 3]], 0, cropped_img.shape[0] - 1)
+
+flipped_img = cropped_img[:, ::-1]
+box_flip = box_crop.copy()
+box_flip[[0, 2]] = cropped_img.shape[1] - 1 - box_crop[[2, 0]]
+
+import matplotlib.patches as patches
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.6))
+for ax, img, b, title in zip(
+    axes, [cropped_img, flipped_img], [box_crop, box_flip], ["crop", "crop + flip"]
+):
+    ax.imshow(img)
+    rect = patches.Rectangle(
+        (b[0], b[1]), b[2] - b[0], b[3] - b[1], linewidth=2, edgecolor="lime", facecolor="none"
+    )
+    ax.add_patch(rect)
+    ax.set_title(title)
+    ax.axis("off")
+plt.tight_layout()
+```
+
+最常见的标注 bug 是：图像做了翻转，框没翻；图像做了 resize，框仍用原图坐标；padding 之后忘了平移。训练时这些错误不会报错，只会让模型学到错位的目标。
+
+## 3.5 数据增强流水线
+
+一个分类任务的最小增强流水线通常包含：随机裁剪、翻转、颜色扰动、归一化。检测和分割还要同步几何变换。顺序会影响结果：
+
+1. 几何变换（crop/flip/rotate）——同时更新标注；
+2. 颜色变换（brightness/contrast/saturation）——只改像素；
+3. 张量化与归一化——固定数值范围；
+4. 批处理——同尺寸图像才能堆成 batch。
+
+增强不是越多越好。小数据集上，强增强能抑制过拟合；数据量足够、目标很小或纹理很关键时，过强的裁剪和颜色扰动会破坏标签语义。第 8 章会把增强放进完整训练配方，并用消融实验验证。
+
+## 3.6 工程坑
+
+::: {.callout-warning}
+## 图像预处理的五个陷阱
+
+- **通道顺序**：BGR 图像送进 RGB 预训练模型，颜色统计完全错位。
+- **归一化重复**：数据管道已经除以 255，模型里又除一次，输入接近全 0。
+- **resize 语义不一致**：训练用 PIL，部署用 OpenCV 或 TensorRT，插值结果不同，边界框偏移。
+- **长宽比被忽略**：直接 resize 到正方形会压扁目标，检测框和小目标尤其敏感。
+- **uint8 溢出**：`uint8 + uint8` 会回绕；做算术前先转浮点。
+:::
+
+## 3.7 小结
+
+- 图像在 PyTorch 中是 `(C, H, W)` 浮点张量，颜色约定和数值范围必须固定。
+- RGB 适合显示，HSV/YCbCr 在颜色分离和亮度处理上更方便。
+- 插值和仿射变换都涉及坐标映射；训练、验证、部署必须使用同一语义。
+- 几何增强必须同步更新标注，这是检测/分割数据管道最常见的错误来源。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+**基础**
+
+1. 用最近邻插值实现 `nearest_resize`，与 OpenCV/PIL 的结果比较。
+2. 把 RGB 图像转成灰度，比较 `0.299R + 0.587G + 0.114B` 与简单平均的差异。
+3. 统计本章图像的 RGB 均值和标准差，与 ImageNet 统计量比较。
+
+**进阶**
+
+4. 实现 `align_corners=False` 的双线性 resize，并解释它和 `align_corners=True` 的坐标差异。
+5. 实现带反射填充（reflect padding）的旋转，消除黑边。
+6. 写一个“图像 + 框 + 掩码”同步旋转的增强函数，并用可视化验证。
+
+**研究**
+
+7. 设计实验比较三种 resize 语义（PIL bilinear、OpenCV bilinear、PyTorch align_corners=False）对同一个检测器 mAP 的影响，控制其他变量不变。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- Szeliski, *Computer Vision: Algorithms and Applications*, 第 2 版，第 3 章。
+- PyTorch 文档：[torch.nn.functional.interpolate](https://pytorch.org/docs/stable/generated/torch.nn.functional.interpolate.html)。
+- [D2L：图像增广](https://zh-v2.d2l.ai/chapter_computer-vision/image-augmentation.html)。
