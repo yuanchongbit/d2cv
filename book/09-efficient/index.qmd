@@ -5,36 +5,311 @@ title: "第 9 章 轻量网络与效率"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
-- 前置：第 8 章
-- 预计篇幅：待定
+- 前置：第 7–8 章
+- 预计阅读：70 分钟
+- 算力：CPU 可完成本章示例
 :::
 
-## 学习目标
+“这个模型只有 3M 参数，应该很快。”这是部署讨论里最常见的误判。参数量小不等于延迟低：深度可分离卷积的 FLOPs 很低，但在很多 CPU/GPU 上因为访存和并行度不足，实际延迟反而高于普通卷积。
 
-- 理解参数量、FLOPs、延迟与内存的区别
-- 掌握深度可分离卷积与轻量骨干设计
-- 能做精度-延迟权衡与模型选型
+本章把效率拆成四个指标——参数量、FLOPs、延迟、内存——并手写深度可分离卷积和倒残差块，最后给出一份可执行的选型报告模板。
 
-## 内容规划
+## 9.1 四个效率指标
 
-- 深度可分离卷积、MobileNet、ShuffleNet、GhostNet
-- 精度、参数量、FLOPs、延迟与吞吐
-- 蒸馏、剪枝、量化概览
-- 设备端瓶颈与算子支持
-- 模型选型报告
+| 指标 | 说明 | 适用场景 | 局限 |
+|---|---|---|---|
+| 参数量 | 权重元素个数 | 模型体积、内存占用 | 不反映计算量 |
+| FLOPs/MACs | 乘加次数 | 理论计算量、论文对比 | 不等于实际延迟 |
+| 延迟 | 单次前向耗时 | 实时系统、端侧 | 受实现、batch、硬件影响 |
+| 峰值内存 | 激活 + 权重 + workspace | 显存预算 | 与输入分辨率强相关 |
 
-## 动手
+比较模型时必须冻结变量：**同一设备、同一输入尺寸、同一 batch、同一精度、同一前后处理**。只报 FLOPs 的“提速 2 倍”没有工程意义。
 
-对多种轻量模型做 latency benchmark，给出面向边缘设备的选型结论。
+```{python}
+#| label: efficiency-metrics
+import time
+
+import torch
+from torch import nn
+
+
+def count_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+
+def conv_macs(c_in: int, c_out: int, h: int, w: int, k: int, groups: int = 1) -> int:
+    return h * w * c_out * (c_in // groups) * k * k
+
+
+print("standard 3x3 64->64 @56x56:", f"{conv_macs(64, 64, 56, 56, 3):,} MACs")
+print("depthwise 3x3 64->64 @56x56:", f"{conv_macs(64, 64, 56, 56, 3, groups=64):,} MACs")
+```
+
+## 9.2 深度可分离卷积
+
+标准卷积同时完成空间滤波和通道混合。深度可分离卷积把它拆成两步：
+
+1. **深度卷积**（depthwise convolution）：每个输入通道单独卷积，`groups = C_in`；
+2. **逐点卷积**（pointwise convolution）：`1×1` 卷积混合通道。
+
+计算量比约为：
+
+$$
+\frac{\text{depthwise separable}}{\text{standard}} =
+\frac{1}{C_{out}} + \frac{1}{K^2}.
+$$
+
+当 `C_out = 64`、`K = 3` 时，理论计算量约为标准卷积的 `1/64 + 1/9 ≈ 12.7%`。
+
+```{python}
+#| label: depthwise
+class DepthwiseSeparableConv(nn.Module):
+    def __init__(self, c_in: int, c_out: int, stride: int = 1) -> None:
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            c_in, c_in, kernel_size=3, stride=stride, padding=1, groups=c_in, bias=False
+        )
+        self.pointwise = nn.Conv2d(c_in, c_out, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(c_out)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.bn(self.pointwise(self.depthwise(x))))
+
+
+standard = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False)
+separable = DepthwiseSeparableConv(64, 64)
+print("standard params:", count_params(standard))
+print("separable params:", count_params(separable))
+print("shape:", separable(torch.randn(2, 64, 56, 56)).shape)
+```
+
+### 深度可分离卷积真的更快吗？
+
+```{python}
+#| label: latency-benchmark
+def benchmark(model: nn.Module, x: torch.Tensor, iterations: int = 20) -> float:
+    model.eval()
+    with torch.inference_mode():
+        for _ in range(3):
+            model(x)
+        start = time.perf_counter()
+        for _ in range(iterations):
+            model(x)
+    return (time.perf_counter() - start) / iterations * 1000
+
+
+x = torch.randn(1, 64, 56, 56)
+standard = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False).eval()
+separable = DepthwiseSeparableConv(64, 64).eval()
+
+with torch.inference_mode():
+    for name, model in [("standard", standard), ("separable", separable)]:
+        ms = benchmark(model, x)
+        print(f"{name:10s}: {ms:.3f} ms")
+```
+
+在你的机器上，结果可能和 FLOPs 的比例完全不同。原因包括：深度卷积的通道数多、每个通道计算量小，GPU 并行度不足；`1×1` 卷积受内存带宽限制；算子融合和 kernel 实现差异很大。
+
+**结论：FLOPs 用于筛选候选，延迟必须在目标设备上实测。**
+
+## 9.3 MobileNet 与倒残差
+
+MobileNetV1 的核心就是深度可分离卷积。MobileNetV2 引入**倒残差块**（inverted residual block）：
+
+1. `1×1` 卷积升维（expansion）；
+2. 深度卷积在低分辨率上提取空间特征；
+3. `1×1` 卷积降维；
+4. 输入输出通道相同时加残差连接。
+
+和 ResNet 的“先降维再升维”相反，它先升维再降维，保证深度卷积有足够通道表达。
+
+```{python}
+#| label: inverted-residual
+class InvertedResidual(nn.Module):
+    def __init__(self, c_in: int, c_out: int, stride: int = 1, expand_ratio: int = 4) -> None:
+        super().__init__()
+        hidden = c_in * expand_ratio
+        self.use_residual = stride == 1 and c_in == c_out
+        layers: list[nn.Module] = []
+        if expand_ratio != 1:
+            layers += [
+                nn.Conv2d(c_in, hidden, 1, bias=False),
+                nn.BatchNorm2d(hidden),
+                nn.ReLU6(inplace=True),
+            ]
+        layers += [
+            nn.Conv2d(hidden, hidden, 3, stride=stride, padding=1, groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(hidden, c_out, 1, bias=False),
+            nn.BatchNorm2d(c_out),
+        ]
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.block(x)
+        return x + out if self.use_residual else out
+
+
+block = InvertedResidual(32, 64, stride=2)
+print("inverted residual output:", block(torch.randn(1, 32, 56, 56)).shape)
+```
+
+MobileNetV3 进一步引入 SE 注意力、h-swish 和神经架构搜索。工程上不必追每个版本，先确认目标设备的算子和量化支持：某些端侧加速器对 `ReLU6`、`h-swish`、深度卷积的支持差异很大。
+
+## 9.4 ShuffleNet、GhostNet 与混合策略
+
+- **ShuffleNet**：用分组卷积 + 通道混洗（channel shuffle）降低 `1×1` 卷积成本，同时让组间信息流动。
+- **GhostNet**：用廉价线性变换生成“幽灵”特征图，减少冗余卷积。
+- **MobileViT / EfficientFormer**：把注意力和卷积混合，在移动端兼顾全局建模与效率。
+- **结构化剪枝**：直接删除通道/层，能真正降低延迟；非结构化剪枝通常需要稀疏硬件支持。
+
+通道混洗的实现很直观：
+
+```{python}
+#| label: channel-shuffle
+def channel_shuffle(x: torch.Tensor, groups: int) -> torch.Tensor:
+    n, c, h, w = x.shape
+    x = x.reshape(n, groups, c // groups, h, w)
+    x = x.transpose(1, 2)
+    return x.reshape(n, c, h, w)
+
+
+x = torch.arange(2 * 8 * 2 * 2).reshape(2, 8, 2, 2).float()
+shuffled = channel_shuffle(x, groups=4)
+print("same shape:", shuffled.shape)
+print("channel 0 after shuffle equals original channel 0:", torch.equal(shuffled[:, 0], x[:, 0]))
+```
+
+## 9.5 蒸馏、剪枝与量化
+
+### 知识蒸馏
+
+用教师模型的软输出监督学生：
+
+$$
+\mathcal{L} = (1-\alpha)\,\mathcal{L}_{\text{CE}}(y, p_s) + \alpha T^2 \cdot \mathrm{KL}(p_t^T \,\|\, p_s^T).
+$$
+
+温度 `T` 平滑教师分布，`T²` 用于补偿梯度尺度。蒸馏的价值在于传递“类别之间的相似性”，而不只是硬标签。
+
+```{python}
+#| label: distillation
+def distillation_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    targets: torch.Tensor,
+    temperature: float = 4.0,
+    alpha: float = 0.7,
+) -> torch.Tensor:
+    hard = nn.functional.cross_entropy(student_logits, targets)
+    soft = nn.functional.kl_div(
+        nn.functional.log_softmax(student_logits / temperature, dim=1),
+        nn.functional.softmax(teacher_logits / temperature, dim=1),
+        reduction="batchmean",
+    ) * temperature**2
+    return (1 - alpha) * hard + alpha * soft
+
+
+student = torch.randn(8, 10)
+teacher = torch.randn(8, 10)
+targets = torch.randint(0, 10, (8,))
+print("distill loss:", distillation_loss(student, teacher, targets).item())
+```
+
+### 剪枝
+
+- **非结构化剪枝**：把不重要的权重置零，压缩率高，但普通硬件不一定加速。
+- **结构化剪枝**：删除整个通道/卷积核，能直接减少 FLOPs 和延迟，但需要重训恢复精度。
+- **重要性准则**：权重绝对值、BN 缩放因子、Taylor 展开、灵敏度分析。
+
+### 量化
+
+- **训练后量化（PTQ）**：用校准集统计激活范围，把 FP32 转成 INT8，部署简单。
+- **量化感知训练（QAT）**：训练时模拟量化误差，精度通常更好。
+- **混合精度**：敏感层保留 FP16/FP32，其余用 INT8。
+
+量化最常见的坑是**前后处理没有一起量化**：模型输入归一化、resize、NMS 仍在 FP32，导致端到端延迟没有下降，甚至因为数据搬运变慢。
+
+## 9.6 选型报告模板
+
+不要只写“MobileNet 更轻”。一份可用的选型报告至少包含：
+
+| 项目 | 示例 |
+|---|---|
+| 任务与指标 | 分类 Top-1、检测 mAP、分割 mIoU |
+| 候选模型 | ResNet-18、MobileNetV3、ViT-Tiny |
+| 输入 | `1×3×224×224`，FP16/INT8 |
+| 硬件 | 目标 CPU/GPU/边缘设备型号 |
+| 延迟 | p50/p95，batch=1 和 batch=8 |
+| 内存 | 峰值 RSS/显存 |
+| 精度 | 同一验证集，同一前后处理 |
+| 结论 | 满足预算的 Pareto 前沿，而不是单一冠军 |
+
+```{python}
+#| label: latency-table
+def latency_table(models: dict[str, nn.Module], x: torch.Tensor) -> None:
+    print(f"{'model':20s} {'params':>10s} {'latency(ms)':>12s}")
+    for name, model in models.items():
+        ms = benchmark(model, x)
+        print(f"{name:20s} {count_params(model):10,d} {ms:12.3f}")
+
+
+latency_table(
+    {
+        "standard conv": nn.Conv2d(64, 64, 3, padding=1, bias=False),
+        "depthwise sep": DepthwiseSeparableConv(64, 64),
+        "inverted residual": InvertedResidual(64, 64, stride=1),
+    },
+    torch.randn(1, 64, 56, 56),
+)
+```
+
+## 9.7 工程坑
+
+::: {.callout-warning}
+## 效率优化的常见陷阱
+
+- **只看参数量**：全连接层参数多但不一定慢；深度卷积参数少但可能更慢。
+- **只看 FLOPs**：访存、并行度、算子融合和内存带宽往往决定实际延迟。
+- **batch=1 与 batch=32 结论相反**：端侧通常 batch=1，服务器看吞吐，必须分别测。
+- **忽略预处理**：图像 decode/resize/归一化可能占总延迟的一半。
+- **量化后不跑精度回归**：INT8 对长尾类别、小目标、检测框回归更敏感。
+- **在训练模式下测延迟**：BatchNorm/Dropout 行为不同，延迟和结果都不可比。
+:::
+
+## 9.8 小结
+
+- 效率有四个维度：参数、FLOPs、延迟、内存，必须分别测量。
+- 深度可分离卷积大幅降低理论计算量，但实际加速依赖硬件和实现。
+- MobileNetV2 的倒残差块先升维再降维，兼顾表达与效率。
+- 蒸馏、剪枝、量化是三条不同的压缩路径，必须做精度回归和端到端延迟测试。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+**基础**
+
+1. 计算 `3×3` 标准卷积和深度可分离卷积在 `C_in=C_out=128` 时的参数量与 MACs。
+2. 修改倒残差的 `expand_ratio`，观察参数量和输出形状。
+3. 在 CPU 上测量 batch=1 和 batch=8 的延迟，比较排序是否变化。
+
+**进阶**
+
+4. 实现通道混洗，并验证它确实是分组卷积后的通道重排。
+5. 用 torch profiler 找出模型前向中耗时最高的三个算子。
+6. 对一个小模型做动态量化，比较模型体积、延迟和精度。
+
+**研究**
+
+7. 在同一移动端设备上比较 MobileNetV3、ShuffleNetV2、GhostNet 和 ViT-Tiny 的延迟-精度 Pareto 前沿，记录量化前后的变化，并解释瓶颈来自计算还是访存。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- Howard et al., *MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications*, 2017。
+- Sandler et al., *MobileNetV2: Inverted Residuals and Linear Bottlenecks*, CVPR 2018。
+- Zhang et al., *ShuffleNet: An Extremely Efficient Convolutional Neural Network for Mobile Devices*, CVPR 2018。
+- Han et al., *GhostNet: More Features from Cheap Operations*, CVPR 2020。
+- Hinton et al., *Distilling the Knowledge in a Neural Network*, 2015。

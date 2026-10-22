@@ -5,36 +5,225 @@ title: "第 11 章 自监督与视觉基础模型"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
-- 前置：第 10 章
-- 预计篇幅：待定
+- 前置：第 8、10 章
+- 预计阅读：75 分钟
+- 算力：CPU 可完成本章示例；预训练/微调建议单卡 12 GB 以上
 :::
 
-## 学习目标
+标注数据昂贵，未标注图像几乎无限。自监督学习（self-supervised learning, SSL）用数据本身构造监督信号，先学一个通用表示，再迁移到下游任务。CLIP、DINOv2、MAE 等模型让“预训练 + 轻量适配”成为视觉工程的默认起点。
 
-- 理解对比学习、掩码建模与自蒸馏的差异
-- 掌握 linear probe、kNN 与 fine-tune 评估协议
-- 能把基础模型特征用于检索与少样本任务
+本章不训练大模型，而是手写对比损失、评估表示质量，并解释为什么自监督模型看起来“什么都会一点”。
 
-## 内容规划
+## 11.1  pretext task：标签从数据里来
 
-- 对比学习：SimCLR、MoCo、BYOL
-- 掩码建模：MAE
-- 自蒸馏：DINO、DINOv2
-- linear probe、kNN、fine-tune
-- 特征检索与少样本分类
+自监督的核心是设计一个**代理任务**（pretext task），让模型从数据本身获得监督：
 
-## 动手
+| 方法 | 代理任务 | 学到的表示 |
+|---|---|---|
+| SimCLR | 同一图像的两个增强视图互为正样本 | 增强不变性 |
+| MoCo | 用动量编码器和队列构造负样本 | 大规模对比学习 |
+| BYOL | 只用正样本，预测另一视图 | 无需负样本 |
+| MAE | 遮挡 patch，重建像素 | 局部与全局结构 |
+| DINO | 学生预测教师的分布 | 语义一致、聚类结构 |
+| DINOv2 | 大规模蒸馏 + 精心数据 | 通用视觉特征 |
 
-用 DINOv2 特征做图像检索与少样本分类，比较三种评估协议。
+对比学习最关键的设计是**正负样本**：同一图像的不同视图是正样本，其他图像是负样本。模型要学会把正样本拉近、负样本推远。
+
+## 11.2 InfoNCE：把匹配问题变成分类问题
+
+给定一个 batch 的 `N` 对正样本 `(z_i, z_i^+)`，把第 `i` 个样本的正样本视为正确类别，其余 `N-1` 个样本视为负类：
+
+$$
+\mathcal{L}_i = -\log
+\frac{\exp(\mathrm{sim}(z_i, z_i^+)/\tau)}
+{\sum_{j=1}^{N}\exp(\mathrm{sim}(z_i, z_j^+)/\tau)},
+$$
+
+其中 `sim` 通常用余弦相似度，`τ` 是温度。这个损失就是在一个 `N` 类分类问题上做交叉熵。
+
+```{python}
+#| label: infonce
+import torch
+import torch.nn.functional as F
+
+
+def info_nce(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+    z1 = F.normalize(z1, dim=1)
+    z2 = F.normalize(z2, dim=1)
+    logits = z1 @ z2.T / temperature
+    labels = torch.arange(z1.size(0), device=z1.device)
+    return 0.5 * (
+        F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)
+    )
+
+
+torch.manual_seed(0)
+base = torch.randn(32, 64)
+positive = base + 0.35 * torch.randn_like(base)
+negative = torch.randn_like(base)
+
+for tau in [0.05, 0.1, 0.2, 0.5, 1.0]:
+    loss = info_nce(base, positive, tau)
+    print(f"tau={tau:>4}: loss={loss.item():.4f}")
+```
+
+温度控制分布的尖锐程度：`τ` 越小，模型越关注最难的负样本，梯度更集中；`τ` 太大，所有负样本权重接近，表示学习变弱。SimCLR 常用 `0.1–0.2`，但最优值和 batch size、数据、增强强相关。
+
+### 为什么需要大 batch
+
+InfoNCE 的分母包含 batch 内所有负样本。batch 越大，负样本越多，表示越有判别性。SimCLR 的关键发现之一就是：大 batch + 强增强 + 非线性投影头能显著提升线性探测精度。MoCo 用队列把负样本数量与 batch size 解耦，适合显存有限的场景。
+
+## 11.3 评估表示质量：三种协议
+
+自监督模型不直接输出类别，评估方式决定结论：
+
+| 协议 | 做法 | 优点 | 局限 |
+|---|---|---|---|
+| Linear probe | 冻结 backbone，训练线性分类头 | 衡量特征线性可分性 | 不反映微调潜力 |
+| kNN | 用特征最近邻投票 | 无需训练、快速 | 对特征尺度和距离敏感 |
+| Fine-tune | 解冻部分/全部参数 | 最接近实际部署 | 成本高，方差大 |
+
+```{python}
+#| label: knn-eval
+def make_clustered_features(
+    num_classes: int = 5, per_class: int = 100, dim: int = 32, noise: float = 0.35, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(seed)
+    centers = torch.randn(num_classes, dim, generator=generator) * 2
+    features, labels = [], []
+    for c in range(num_classes):
+        features.append(centers[c] + noise * torch.randn(per_class, dim, generator=generator))
+        labels.append(torch.full((per_class,), c))
+    return torch.cat(features), torch.cat(labels)
+
+
+features, labels = make_clustered_features()
+features = F.normalize(features, dim=1)
+train_idx = torch.arange(0, len(features), 5)
+test_idx = torch.arange(len(features))[torch.arange(len(features)) % 5 != 0]
+
+
+def knn_accuracy(
+    train_x: torch.Tensor, train_y: torch.Tensor, test_x: torch.Tensor, test_y: torch.Tensor, k: int = 5
+) -> float:
+    sim = test_x @ train_x.T
+    topk = sim.topk(k, dim=1).indices
+    votes = train_y[topk]
+    pred = votes.mode(dim=1).values
+    return (pred == test_y).float().mean().item()
+
+
+print("5-NN accuracy on synthetic clusters:", knn_accuracy(features[train_idx], labels[train_idx], features[test_idx], labels[test_idx]))
+```
+
+真实模型评估时，linear probe 和 kNN 的结论可能不同：前者适合判断类别边界是否线性可分，后者更关注局部邻域结构。论文里必须说明用了哪一种，以及是否做了 L2 归一化。
+
+### Alignment 与 uniformity
+
+对比学习希望正样本对齐、特征在球面上均匀分布。两个常用诊断指标：
+
+```{python}
+#| label: alignment-uniformity
+pos = F.normalize(positive, dim=1)
+neg = F.normalize(negative, dim=1)
+alignment = (pos - F.normalize(base, dim=1)).norm(dim=1).pow(2).mean()
+uniformity = torch.pdist(neg).pow(2).mean().neg().exp().log()
+print("alignment (lower is better):", alignment.item())
+print("uniformity (lower is better):", uniformity.item())
+```
+
+## 11.4 MAE、DINO 与 DINOv2
+
+### MAE
+
+掩码自编码器（masked autoencoder）随机遮住 75% 的 patch，只把可见 patch 送入编码器，再用轻量解码器重建被遮住的像素。它迫使模型学习**全局结构**，而不是局部纹理。
+
+MAE 的关键设计：非对称编码器-解码器、极高掩码率、只计算被遮 patch 的重建损失。训练效率高，适合大分辨率图像。
+
+### DINO
+
+DINO 用教师-学生架构，教师参数是学生参数的指数移动平均：
+
+$$
+\theta_t \leftarrow \lambda \theta_t + (1-\lambda)\theta_s.
+$$
+
+学生输出经 softmax 后匹配教师的中心化、锐化分布。它不需要负样本，却能学到语义聚类结构，注意力图也常常对应物体区域。
+
+### DINOv2
+
+DINOv2 把自监督训练扩展到大规模精选数据，并提供不同尺寸的 backbone。它的特征在分类、检索、深度估计、分割等任务上都有很强的迁移能力，常被当作“视觉领域的通用文本嵌入”。
+
+```python
+import torch
+from transformers import AutoImageProcessor, AutoModel
+
+processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+model = AutoModel.from_pretrained("facebook/dinov2-base").eval()
+inputs = processor(images=image, return_tensors="pt")
+with torch.inference_mode():
+    features = model(**inputs).last_hidden_state[:, 0]
+print(features.shape)
+```
+
+这段代码需要下载权重，不在构建时执行。生产中要注意模型许可、输入分辨率、是否使用 CLS token 还是 patch token 均值。
+
+## 11.5 自监督特征怎么用
+
+| 场景 | 推荐方式 | 原因 |
+|---|---|---|
+| 少样本分类 | 线性探测 / kNN | 训练成本低，快速验证特征 |
+| 中等数据微调 | 冻结前几层，微调后几层 | 平衡过拟合与适配 |
+| 检索/聚类 | 直接用特征 + 余弦相似度 | 无需标签，语义结构好 |
+| 检测/分割 | 作为 backbone 微调 | 需要任务特定的解码器 |
+| 开放词汇 | CLIP/DINOv2 + 文本/原型 | 支持类别动态变化 |
+
+自监督不是“无标签就能超过有监督”。在数据量小、任务与预训练分布差异大时，有监督预训练或强微调仍可能更好。关键是比较**同一下游协议**下的表现，而不是只看预训练损失。
+
+## 11.6 工程坑
+
+::: {.callout-warning}
+## 自监督的常见陷阱
+
+- **增强太弱**：正样本几乎相同，模型学到平凡解；增强太强又会破坏语义。
+- **温度/batch 不匹配**：小 batch 上照搬大 batch 的超参数，负样本不足，效果明显下降。
+- **表示坍塌**：所有输出趋同，loss 很低但没有信息；BYOL/DINO 需要停止梯度、动量教师、中心化等机制。
+- **评估协议不一致**：linear probe 与 kNN 结论不同，不能混着报。
+- **特征未归一化**：余弦相似度和欧氏距离的排序不同，检索结果会变。
+- **预训练数据泄漏**：下游测试集出现在预训练语料里，指标虚高。
+:::
+
+## 11.7 小结
+
+- 自监督用数据自身构造代理任务，学习可迁移的视觉表示。
+- InfoNCE 把正负样本匹配变成分类问题，温度和大 batch 是关键设计。
+- linear probe、kNN、fine-tune 衡量的是不同能力，报告时必须说明协议。
+- MAE 重建像素、DINO 蒸馏语义、DINOv2 扩展数据与规模，形成了现代视觉基础模型的主力路线。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+**基础**
+
+1. 改变 InfoNCE 的温度，画出损失随温度变化的曲线。
+2. 用不同的噪声强度生成正样本，观察 alignment 和 uniformity。
+3. 在 kNN 评估中改变 `k`，观察准确率变化。
+
+**进阶**
+
+4. 实现一个小的 SimCLR 训练循环（两层 MLP + NT-Xent），在 CIFAR-10 子集上训练 10 个 epoch，比较 linear probe 与随机初始化。
+5. 实现 BYOL 的预测头和停止梯度，验证没有负样本也能避免坍塌。
+6. 用 MAE 的掩码策略遮住 75% patch，比较不同掩码率对重建损失的影响。
+
+**研究**
+
+7. 在同一个下游数据集上比较 CLIP、DINOv2、MAE 和 ImageNet 有监督特征的 linear probe、kNN 和微调表现，分析预训练数据分布与任务相似度的影响。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- Chen et al., *A Simple Framework for Contrastive Learning of Visual Representations*, ICML 2020（SimCLR）。
+- He et al., *Momentum Contrast for Unsupervised Visual Representation Learning*, CVPR 2020（MoCo）。
+- He et al., *Masked Autoencoders Are Scalable Vision Learners*, CVPR 2022（MAE）。
+- Oquab et al., *DINOv2: Learning Robust Visual Features without Supervision*, TMLR 2024。
+- Radford et al., *Learning Transferable Visual Models From Natural Language Supervision*, ICML 2021（CLIP）。

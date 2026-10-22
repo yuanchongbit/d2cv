@@ -5,36 +5,311 @@ title: "第 10 章 Vision Transformer 与混合架构"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
-- 前置：第 8 章
-- 预计篇幅：待定
+- 前置：第 7–8 章
+- 预计阅读：80 分钟
+- 算力：CPU 可完成本章示例；完整 ViT 微调建议单卡 12 GB 以上
 :::
 
-## 学习目标
+Vision Transformer（ViT）把图像切成 patch，当成一串 token，然后用 Transformer 编码。它放弃了卷积的局部连接和权重共享，却在足够大的数据上超过了 CNN。这件事的意义不只是“又一个新的 backbone”，而是提醒我们：**归纳偏置是效率工具，不是正确性的必要条件。**
 
-- 理解 patch embedding、自注意力与位置编码
-- 掌握 ViT/Swin/ConvNeXt 的设计差异
-- 能根据数据规模与任务选择 CNN 或 Transformer
+本章手写 patch embedding 和多头自注意力，搭建一个小 ViT，并讨论它为什么在小数据上不如 CNN，以及 Swin、ConvNeXt 如何把两者的优势结合起来。
 
-## 内容规划
+## 10.1 从图像到 token
 
-- patch embedding 与 CLS token
-- 多头自注意力与位置编码
-- ViT、Swin、ConvNeXt
-- CNN-Transformer 混合架构
-- attention map 与数据效率
+ViT 的第一步不是卷积堆叠，而是把图像切成固定大小的 patch：
 
-## 动手
+- 输入 `(N, 3, 224, 224)`；
+- patch 大小 `16×16`；
+- 每个 patch 展平后是 `16×16×3 = 768` 维；
+- patch 数量 `(224/16)² = 196`；
+- 用一个共享的线性层把每个 patch 映射到 `dim` 维。
 
-用 timm 微调 ViT，对比 CNN 在小数据与大数据上的表现。
+这等价于一个 `kernel_size=16, stride=16` 的卷积。卷积核不重叠，每个输出位置就是一个 token。
+
+```{python}
+#| label: patch-embed
+import torch
+from torch import nn
+
+
+class PatchEmbed(nn.Module):
+    def __init__(self, in_channels: int = 3, dim: int = 64, patch_size: int = 16) -> None:
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)  # (N, dim, H/P, W/P)
+        return x.flatten(2).transpose(1, 2)  # (N, num_patches, dim)
+
+
+embed = PatchEmbed(dim=64, patch_size=16)
+tokens = embed(torch.randn(2, 3, 224, 224))
+print("token shape:", tokens.shape)
+print("patch grid:", 224 // 16, "x", 224 // 16)
+```
+
+```{python}
+#| label: fig-patches
+#| fig-cap: "把 224×224 图像切成 16×16 的 patch。ViT 把每个 patch 当作一个 token，patch 之间没有重叠。"
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+
+image_path = next(
+    p for p in (Path("assets/chelsea.png"), Path("../assets/chelsea.png")) if p.exists()
+)
+image = Image.open(image_path).convert("RGB").resize((224, 224))
+image_np = np.asarray(image)
+
+fig, ax = plt.subplots(figsize=(5, 5))
+ax.imshow(image_np)
+for i in range(1, 14):
+    ax.axvline(i * 16 - 0.5, color="white", linewidth=0.4, alpha=0.6)
+    ax.axhline(i * 16 - 0.5, color="white", linewidth=0.4, alpha=0.6)
+ax.set_title("224 / 16 = 14 x 14 patches")
+ax.axis("off")
+plt.tight_layout()
+```
+
+每个 token 加上位置编码（position embedding），因为自注意力本身对顺序没有概念。ViT 还额外加入一个可学习的 `[CLS]` token，最后用它的输出做分类。位置编码可以是可学习向量，也可以是正弦/余弦编码；后者在分辨率变化时更容易插值。
+
+## 10.2 多头自注意力
+
+自注意力让每个 token 从所有 token 聚合信息：
+
+$$
+\mathrm{Attention}(Q, K, V)
+= \mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V.
+$$
+
+`Q`、`K`、`V` 都是输入经过线性投影得到的。除以 `√d_k` 是为了防止点积随维度增大而数值爆炸。多头注意力把特征分成 `h` 组，每组独立计算，再拼接：
+
+$$
+\mathrm{MultiHead}(X) = \mathrm{Concat}(\mathrm{head}_1,\dots,\mathrm{head}_h)W_O.
+$$
+
+```{python}
+#| label: mhsa
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, dim: int = 64, heads: int = 4) -> None:
+        super().__init__()
+        assert dim % heads == 0
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.scale = self.head_dim**-0.5
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor, return_attn: bool = False):
+        n, tokens, dim = x.shape
+        qkv = self.qkv(x).reshape(n, tokens, 3, self.heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(n, tokens, dim)
+        out = self.proj(out)
+        return (out, attn) if return_attn else out
+
+
+mhsa = MultiHeadSelfAttention(dim=64, heads=4)
+x = torch.randn(2, 197, 64)
+out, attn = mhsa(x, return_attn=True)
+print("output:", out.shape)
+print("attention:", attn.shape)
+print("attention rows sum to 1:", attn[0, 0, 0].sum().item())
+```
+
+自注意力的计算复杂度是 `O(N²d)`，`N` 是 token 数。把图像分辨率翻倍，token 数变成 4 倍，注意力矩阵变成 16 倍。这是高分辨率 ViT 的主要瓶颈，也是 Swin 采用窗口注意力的原因。
+
+## 10.3 搭建一个小 ViT
+
+```{python}
+#| label: tiny-vit
+class ViTBlock(nn.Module):
+    def __init__(self, dim: int = 64, heads: int = 4, mlp_ratio: int = 4) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = MultiHeadSelfAttention(dim, heads)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(dim * mlp_ratio, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class TinyViT(nn.Module):
+    def __init__(
+        self, image_size: int = 224, patch_size: int = 16, dim: int = 64,
+        depth: int = 2, heads: int = 4, num_classes: int = 10,
+    ) -> None:
+        super().__init__()
+        self.patch_embed = PatchEmbed(3, dim, patch_size)
+        num_patches = (image_size // patch_size) ** 2
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, dim))
+        self.blocks = nn.ModuleList([ViTBlock(dim, heads) for _ in range(depth)])
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.patch_embed(x)
+        cls = self.cls_token.expand(x.size(0), -1, -1)
+        x = torch.cat([cls, x], dim=1) + self.pos_embed
+        for block in self.blocks:
+            x = block(x)
+        return self.head(self.norm(x)[:, 0])
+
+
+model = TinyViT()
+logits = model(torch.randn(2, 3, 224, 224))
+print("logits:", logits.shape)
+print("parameters:", f"{sum(p.numel() for p in model.parameters()):,}")
+```
+
+一个 2 层、64 维的玩具 ViT 只有几十万参数，远小于 ResNet-18。真实 ViT-Base 是 12 层、768 维、12 头，约 86M 参数。参数不是关键差异，**注意力的全局感受野和数据需求**才是。
+
+### 位置编码的细节
+
+- 可学习位置编码：实现简单，但换分辨率需要插值；
+- 正弦编码：可外推到更长序列，但性能不一定更好；
+- 相对位置编码：Swin、SwinV2 使用，适合窗口注意力；
+- 旋转位置编码（RoPE）：在部分现代视觉模型中使用。
+
+## 10.4 归纳偏置与数据效率
+
+CNN 内置了三个强假设：局部性、平移等变性、层级结构。ViT 没有这些假设，因此：
+
+- 小数据上，ViT 需要更多数据或更强增强才能学到“相邻像素相关”；
+- 大数据上，ViT 可以学到 CNN 归纳偏置之外的长程关系；
+- 混合架构（ConvNeXt、MobileViT、CoAtNet）试图用卷积提供局部先验，用注意力提供全局交互。
+
+| 模型 | 核心思想 | 适合场景 |
+|---|---|---|
+| ViT | 全局自注意力 | 大数据预训练、微调 |
+| Swin | 窗口注意力 + 层级移位 | 检测、分割、高分辨率 |
+| ConvNeXt | 用现代 CNN 设计逼近 Transformer | 需要卷积效率的视觉任务 |
+| MobileViT | 卷积 + 轻量注意力 | 移动端 |
+| Hybrid | CNN stem + Transformer | 高分辨率、数据有限 |
+
+::: {.callout-tip}
+## 选型建议
+
+数据少于 10 万张、没有强预训练权重时，优先用 CNN 或混合架构。使用 ImageNet-21k/LAION 预训练的 ViT 时，小数据微调也可以很强，但要注意预处理、分辨率和归一化必须与预训练一致。
+:::
+
+## 10.5 注意力可视化
+
+注意力的形状是 `(N, heads, tokens, tokens)`。我们可以把 `[CLS]` 对其他 patch 的注意力还原成 `14×14` 热图。下面使用随机初始化模型，**只用于检查可视化流程，不代表语义**。
+
+```{python}
+#| label: fig-attention
+#| fig-cap: "左：patch 网格；右：随机初始化 ViT 的 [CLS] 注意力热图（仅示意，训练后才有语义）。"
+import torchvision.transforms as transforms
+
+transform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+image_t = transform(image).unsqueeze(0)
+with torch.inference_mode():
+    tokens = model.patch_embed(image_t)
+    cls = model.cls_token.expand(1, -1, -1)
+    x = torch.cat([cls, tokens], dim=1) + model.pos_embed
+    attn = model.blocks[0].attn(model.blocks[0].norm1(x), return_attn=True)[1]
+attention_map = attn[0, 0, 0, 1:].reshape(14, 14).numpy()
+attention_map = (attention_map - attention_map.min()) / (np.ptp(attention_map) + 1e-8)
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+axes[0].imshow(image_np)
+for i in range(1, 14):
+    axes[0].axvline(i * 16 - 0.5, color="white", linewidth=0.4, alpha=0.6)
+    axes[0].axhline(i * 16 - 0.5, color="white", linewidth=0.4, alpha=0.6)
+axes[0].set_title("patches")
+axes[0].axis("off")
+axes[1].imshow(image_np)
+axes[1].imshow(attention_map, cmap="jet", alpha=0.5, extent=(0, 224, 224, 0))
+axes[1].set_title("CLS attention (random init)")
+axes[1].axis("off")
+plt.tight_layout()
+```
+
+真实模型的可视化需要加载预训练权重，并选择具体层和头。注意力热图也不是因果解释：高注意力不等于该区域对预测贡献大。第 24 章会用 Grad-CAM 等方法做更可靠的归因。
+
+## 10.6 微调 ViT
+
+用 timm 加载预训练 ViT 做微调的核心代码：
+
+```python
+import timm
+import torch
+
+model = timm.create_model("vit_base_patch16_224", pretrained=True, num_classes=10)
+for param in model.parameters():
+    param.requires_grad = False
+for param in model.head.parameters():
+    param.requires_grad = True
+optimizer = torch.optim.AdamW(
+    [p for p in model.parameters() if p.requires_grad], lr=1e-3, weight_decay=0.05
+)
+```
+
+这段代码不在构建时执行（需要下载权重）。真实微调要注意：
+
+- ViT 对学习率、weight decay 和 warmup 比 CNN 敏感；
+- 小数据先冻结 backbone，只训练 head，再逐步解冻；
+- 混合精度下 LayerNorm 通常保留 FP32；
+- 分辨率变化需要插值位置编码。
+
+## 10.7 工程坑
+
+::: {.callout-warning}
+## ViT 的常见问题
+
+- **patch 尺寸与分辨率不匹配**：`224/16=14`，换成 `256` 后位置编码长度不对，必须插值。
+- **忘记位置编码**：模型仍能训练，但失去空间顺序，性能明显下降。
+- **注意力矩阵爆内存**：高分辨率 + 多层 + 多头，`N²` 迅速吃满显存；用窗口注意力或梯度检查点。
+- **学习率照搬 CNN**：ViT 常需要更小的基础学习率和更长 warmup。
+- **把注意力热图当解释**：注意力权重高不代表因果贡献，需配合扰动/梯度方法。
+- **预处理不一致**：ViT 对归一化和分辨率非常敏感，预训练配置必须对齐。
+:::
+
+## 10.8 小结
+
+- ViT 用 patch embedding 把图像变成 token 序列，用自注意力建模全局关系。
+- 多头注意力通过多个子空间捕捉不同关系，计算复杂度随 token 数平方增长。
+- ViT 放弃 CNN 的归纳偏置，数据效率较低，但大数据预训练后上限更高。
+- Swin、ConvNeXt、混合架构在效率与局部性之间做折中。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+**基础**
+
+1. 修改 patch 大小，计算 token 数和注意力矩阵大小。
+2. 去掉位置编码，训练一个小 ViT，比较准确率。
+3. 比较 4 头、8 头、12 头注意力的参数量和输出形状。
+
+**进阶**
+
+4. 实现正弦位置编码，并验证它可以处理不同 token 数。
+5. 给 ViT 加入一个卷积分支（CNN stem），比较小数据上的收敛速度。
+6. 用注意力 rollout 聚合多层注意力，观察热图变化。
+
+**研究**
+
+7. 在同一个中等规模数据集上比较 ViT、Swin、ConvNeXt 和 ResNet 的样本效率与最终精度，固定参数量、训练轮数和增强，分析归纳偏置的影响。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- Dosovitskiy et al., *An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale*, ICLR 2021。
+- Liu et al., *Swin Transformer: Hierarchical Vision Transformer using Shifted Windows*, ICCV 2021。
+- Liu et al., *A ConvNet for the 2020s*, CVPR 2022（ConvNeXt）。
+- Vaswani et al., *Attention Is All You Need*, NeurIPS 2017。

@@ -5,36 +5,388 @@ title: "第 12 章 迁移学习与参数高效微调"
 ::: {.callout-note}
 ## 本章状态
 
-- 状态：<span class="status status-planned">规划中</span>
+- 状态：<span class="status status-draft">初稿</span>
 - 最后更新：2026-10-23
-- 前置：第 10 章
-- 预计篇幅：待定
+- 前置：第 10、11 章
+- 预计阅读：70 分钟
+- 算力：CPU 可完成本章实验；CLIP 与真实 PEFT 微调建议单卡 8 GB
 :::
 
-## 学习目标
+假设你手上只有 500 张标注图，却要做一个 10 类分类器。从零训练 ResNet-50 会严重过拟合；直接拿 ImageNet 预训练权重，只换最后一层，往往就能得到可用结果。迁移学习（transfer learning）解决的就是“标签少、算力少、但想要好模型”这个现实问题。
 
-- 掌握预训练-微调的常见策略与陷阱
-- 理解 CLIP zero-shot 与线性探测
-- 能用 LoRA/Adapter 做低成本适配
+这一章讨论三件事：预训练特征到底该怎么用、全量微调和参数高效微调（parameter-efficient fine-tuning, PEFT）如何取舍、以及少样本场景下哪些指标会让你误判。
 
-## 内容规划
+## 12.1 三种使用预训练模型的方式
 
-- 预训练-微调范式与冻结策略
-- 判别式学习率与分层解冻
-- CLIP zero-shot 与 linear probe
-- LoRA、Adapter、Prompt tuning
-- 少样本与开放词汇分类
+拿到一个预训练骨干，常见做法有三种：
 
-## 动手
+| 方式 | 训练参数 | 适用场景 | 主要风险 |
+|---|---|---|---|
+| 特征提取 + 线性头 | 只有分类头 | 数据极少、任务与预训练域接近 | 特征不适配细粒度任务 |
+| 全量微调 | 全部参数 | 数据中等以上、算力充足 | 过拟合、灾难性遗忘 |
+| PEFT（LoRA/Adapter 等） | 少量新增参数 | 多任务共享底座、显存受限 | 秩或瓶颈选得太小 |
 
-比较全量微调与 PEFT 在少样本分类上的精度、显存与训练时间。
+三者的差别不只是“训练多少参数”，还包括优化器状态、激活显存和部署方式。全量微调要为每个参数保存梯度与 AdamW 的一阶、二阶矩；PEFT 只保存新增部分，但前向仍然要过整个底座。
+
+线性探测（linear probe）是评估预训练特征的常用协议：冻结骨干，只在特征上训练一个线性分类器。它的准确率反映特征的线性可分性，而不是模型的上限。另一个协议是 kNN 分类，不需要训练，但对特征尺度敏感。
+
+## 12.2 冻结参数与可训练量
+
+先看一个具体数字。ResNet-18 有约 1100 万参数，替换分类头后只训练最后一层，可训练参数不到 0.05%。
+
+```{python}
+#| label: freeze-resnet
+import torch
+from torchvision.models import resnet18
+
+model = resnet18(num_classes=10)
+
+def count_parameters(module: torch.nn.Module) -> tuple[int, int]:
+    total = sum(p.numel() for p in module.parameters())
+    trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+    return total, trainable
+
+for p in model.parameters():
+    p.requires_grad = False
+for p in model.fc.parameters():
+    p.requires_grad = True
+
+total, trainable = count_parameters(model)
+print(f"total: {total:,}")
+print(f"trainable: {trainable:,} ({trainable / total:.4%})")
+```
+
+冻结不等于省显存。如果输入仍然带着梯度流过整个骨干，反向传播需要保存的中间激活一点也不会少。纯特征提取应该配合 `torch.no_grad()` 或 `model.eval()` 下的推理模式，把特征算完缓存起来，再训练分类头。
+
+冻结还会影响归一化层。BatchNorm 在训练模式下会更新 running mean/var；如果你冻结了骨干却忘了切到 `eval`，统计量仍会被小批量数据改写，预训练特征会被悄悄破坏。LayerNorm 没有 running 统计量，但也应该在冻结时保持参数不变。
+
+::: {.callout-tip}
+## 冻结清单
+
+1. 把所有骨干参数设为 `requires_grad=False`。
+2. 调用 `model.eval()`，或至少把 BatchNorm 设为 eval。
+3. 特征提取阶段使用 `torch.no_grad()`。
+4. 保存 checkpoint 时记录底座版本与预处理配置。
+:::
+
+## 12.3 判别式学习率
+
+微调时，骨干和分类头不该用同一个学习率。分类头是随机初始化的，需要较大步长；骨干已经接近一个好的解，步长过大会把它推离预训练分布。
+
+```{python}
+#| label: param-groups
+backbone_params = [p for n, p in model.named_parameters() if not n.startswith("fc.")]
+head_params = list(model.fc.parameters())
+
+for p in backbone_params:
+    p.requires_grad = True
+
+optimizer = torch.optim.SGD(
+    [
+        {"params": backbone_params, "lr": 1e-4},
+        {"params": head_params, "lr": 1e-3},
+    ],
+    momentum=0.9,
+    weight_decay=5e-4,
+)
+
+for group in optimizer.param_groups:
+    print(f"lr={group['lr']:.0e}, params={sum(p.numel() for p in group['params']):,}")
+```
+
+更细的做法是逐层衰减（layer-wise learning rate decay）：越靠近输入的层，学习率越小。视觉 Transformer 微调中常见衰减系数 0.65–0.75。层数越多，这个策略越重要，因为浅层学到的边缘和纹理通常不需要大改。
+
+判断是否该解冻更多层，可以做一个便宜的实验：先只训练头，再逐段解冻最后 1–2 个 stage，观察验证集指标。若提升很小而显存翻倍，就停在线性探测。
+
+## 12.4 少样本实验：预训练到底带来了什么
+
+下面用一个可控的合成任务验证迁移的收益。源域是灰度、低频的光栅条纹，按方向分 4 类；目标域变成彩色、高频、强噪声，但类别语义相同。我们只给目标域每类 5 张图，共 20 张训练样本，比较三种策略。
+
+这不是 ImageNet 实验，结论不能直接外推；它的价值是把“预训练特征有用”这件事放在你能完全理解的数据上。
+
+```{python}
+#| label: few-shot-transfer
+import copy
+import math
+import statistics
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+
+def make_gratings(n: int, freq: float, seed: int, noise: float = 1.6,
+                  size: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+    g = torch.Generator().manual_seed(seed)
+    ys, xs = torch.meshgrid(torch.arange(size), torch.arange(size), indexing="ij")
+    angles = torch.tensor([0.0, 45.0, 90.0, 135.0])
+    images, labels = [], []
+    for _ in range(n):
+        k = torch.randint(4, (1,), generator=g).item()
+        theta = angles[k] * math.pi / 180
+        phase = torch.rand(1, generator=g).item() * 2 * math.pi
+        wave = torch.cos(
+            2 * math.pi * freq * (xs * math.cos(theta) + ys * math.sin(theta)) / size + phase
+        )
+        img = wave.unsqueeze(0).repeat(3, 1, 1) * torch.tensor([1.0, 0.55, 0.3]).view(3, 1, 1)
+        images.append(img + noise * torch.randn(3, size, size, generator=g))
+        labels.append(k)
+    return torch.stack(images), torch.tensor(labels)
+
+
+class TinyCNN(nn.Module):
+    def __init__(self, num_classes: int = 4) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 8, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(8, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+        )
+        self.head = nn.Linear(16 * 8 * 8, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(torch.flatten(self.features(x), 1))
+
+
+def fit(model: nn.Module, x: torch.Tensor, y: torch.Tensor,
+        epochs: int, lr: float) -> nn.Module:
+    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
+    for _ in range(epochs):
+        model.train()
+        opt.zero_grad()
+        F.cross_entropy(model(x), y).backward()
+        opt.step()
+    return model
+
+
+@torch.no_grad()
+def accuracy(model: nn.Module, x: torch.Tensor, y: torch.Tensor) -> float:
+    model.eval()
+    return (model(x).argmax(1) == y).float().mean().item()
+
+
+def run(seed: int) -> list[float]:
+    torch.manual_seed(seed)
+    src_x, src_y = make_gratings(400, freq=4.0, seed=1, noise=0.9)
+    tgt_x, tgt_y = make_gratings(20, freq=6.0, seed=2)
+    test_x, test_y = make_gratings(400, freq=6.0, seed=3)
+
+    pretrained = fit(TinyCNN(), src_x, src_y, epochs=15, lr=2e-3)
+    scratch = fit(TinyCNN(), tgt_x, tgt_y, epochs=60, lr=2e-3)
+
+    probe = copy.deepcopy(pretrained)
+    for p in probe.features.parameters():
+        p.requires_grad = False
+    probe = fit(probe, tgt_x, tgt_y, epochs=60, lr=2e-3)
+
+    finetune = fit(copy.deepcopy(pretrained), tgt_x, tgt_y, epochs=60, lr=2e-4)
+
+    return [accuracy(m, test_x, test_y) for m in (scratch, probe, finetune)]
+
+
+results = [run(seed) for seed in (0, 1, 2)]
+names = ["从零训练", "冻结特征 + 线性头", "全量微调"]
+for name, values in zip(names, zip(*results)):
+    mean = statistics.mean(values)
+    std = statistics.stdev(values)
+    print(f"{name:<12s} {mean:.3f} ± {std:.3f}  {[round(v, 3) for v in values]}")
+```
+
+结果符合预期：从零训练只能到随机猜测附近，预训练特征把线性头抬到 0.7 左右，全量微调最高，但三个种子之间方差很大。这里有两个容易被忽略的点：
+
+- 只有 20 个训练样本，单个种子的结果没有解释力，必须看均值和方差。
+- 全量微调在极小数据上既可能最好，也可能因为初始化不同而崩掉；“PEFT 一定更准”或“全量微调一定更好”都不成立。
+
+若把目标样本增加到每类几百张，从零训练的差距会迅速缩小；若源域与目标域差得很远（例如自然图像迁移到医学影像），冻结特征的优势也会减弱。迁移收益取决于**域间距**和**目标数据量**，而不是模型大小。
+
+## 12.5 CLIP 与零样本分类
+
+CLIP 把图像编码器和文本编码器放在同一个嵌入空间里训练，用对比损失对齐“图像—描述”对。推理时，把类别名写成句子，编码成文本向量，再与图像向量算余弦相似度，取最高分：
+
+$$
+p(y=i \mid x) = \frac{\exp(\cos(f(x), g(t_i)) / \tau)}{\sum_{j=1}^{C} \exp(\cos(f(x), g(t_j)) / \tau)}
+$$
+
+其中 $f$ 是图像编码器，$g$ 是文本编码器，$t_i$ 是第 $i$ 类的提示文本，$\tau$ 是温度。这个过程不需要任何目标域标注，所以叫零样本（zero-shot）。
+
+```{python}
+#| label: clip-zero-shot
+#| eval: false
+import open_clip
+import torch
+from PIL import Image
+
+model, _, preprocess = open_clip.create_model_and_transforms(
+    "ViT-B-32", pretrained="laion2b_s34b_b79k"
+)
+tokenizer = open_clip.get_tokenizer("ViT-B-32")
+model.eval()
+
+classes = ["a photo of a cat", "a photo of a dog", "a photo of a car"]
+text = tokenizer(classes)
+image = preprocess(Image.open("sample.jpg")).unsqueeze(0)
+
+with torch.no_grad():
+    image_features = model.encode_image(image)
+    text_features = model.encode_text(text)
+    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+    probs = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+
+print(dict(zip(classes, probs[0].tolist())))
+```
+
+提示词对结果影响很大。“a photo of a {}”通常比裸类别名好；领域越特殊，越应该加入领域描述，例如“a satellite photo of a {}”。但这不能替代标注数据：CLIP 对细粒度类别、计数、空间关系和罕见概念仍然很弱。
+
+评估零样本时还要注意类别平衡与候选集。把 1000 个类别换成 10 个类别，准确率会显著变化；报告数字时必须写清类别集合、提示模板和是否做了 prompt ensemble。
+
+## 12.6 从零实现 LoRA
+
+LoRA（low-rank adaptation）假设微调带来的权重更新是低秩的。它不修改原权重 $W$，而是学习一个低秩分解：
+
+$$
+W' = W + \frac{\alpha}{r} BA
+$$
+
+其中 $W \in \mathbb{R}^{d_{out} \times d_{in}}$ 冻结，$B \in \mathbb{R}^{d_{out} \times r}$、$A \in \mathbb{R}^{r \times d_{in}}$ 可训练，$r \ll \min(d_{in}, d_{out})$，$\alpha$ 控制缩放。初始化时 $B=0$，所以微调开始前模型行为与原模型完全一致。
+
+```{python}
+#| label: lora
+import math
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, rank: int = 8, alpha: float = 16.0) -> None:
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad = False
+        self.rank = rank
+        self.scale = alpha / rank
+        self.lora_a = nn.Parameter(torch.empty(rank, base.in_features))
+        self.lora_b = nn.Parameter(torch.zeros(base.out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        update = (x @ self.lora_a.T) @ self.lora_b.T
+        return self.base(x) + update * self.scale
+
+    @torch.no_grad()
+    def merge(self) -> nn.Linear:
+        merged = nn.Linear(
+            self.base.in_features, self.base.out_features,
+            bias=self.base.bias is not None,
+        )
+        merged.weight.copy_(self.base.weight + self.scale * self.lora_b @ self.lora_a)
+        if self.base.bias is not None:
+            merged.bias.copy_(self.base.bias)
+        return merged
+
+
+torch.manual_seed(0)
+base = nn.Linear(768, 768, bias=False)
+layer = LoRALinear(base, rank=8, alpha=16.0)
+x = torch.randn(2, 768)
+
+print("initial max diff:", (layer(x) - base(x)).abs().max().item())
+print("frozen base params:", sum(p.numel() for p in layer.base.parameters()))
+print("trainable LoRA params:", sum(p.numel() for p in layer.parameters()
+                                     if p.requires_grad))
+print("full fine-tune would be:", base.weight.numel())
+
+merged = layer.merge()
+print("merge max diff:", (merged(x) - layer(x)).abs().max().item())
+```
+
+秩 $r=8$ 时，一个 $768 \times 768$ 的线性层从 589,824 个可训练参数降到 12,288 个，约为原来的 2%。Transformer 的注意力通常只给 $W_q$、$W_v$ 加 LoRA；给所有线性层加会提高容量，也提高显存和推理开销。
+
+LoRA 的工程细节：
+
+- `alpha` 不是独立超参，实际缩放是 $\alpha / r$。换秩时要同步调整，否则等效学习率会变。
+- 合并后的权重可以完全消除推理延迟，但合并会丢失“可拆卸”能力，多任务服务应保留适配器并按请求切换。
+- 低精度训练时，`lora_a` 和 `lora_b` 通常保持 fp32，避免小梯度下溢。
+- 保存 checkpoint 只存适配器，必须同时记录底座模型的名字、版本和权重哈希。
+
+## 12.7 Adapter 与提示微调
+
+Adapter 在冻结层之间插入一个小瓶颈模块，结构是“降维—激活—升维”，再与输入相加。它与 LoRA 的差别在于：LoRA 修改的是现有线性层的权重增量，Adapter 增加的是新的串行计算。
+
+```{python}
+#| label: adapter
+class Adapter(nn.Module):
+    def __init__(self, dim: int, bottleneck: int = 8) -> None:
+        super().__init__()
+        self.down = nn.Linear(dim, bottleneck)
+        self.up = nn.Linear(bottleneck, dim)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.up(F.gelu(self.down(x)))
+
+
+adapter = Adapter(768, bottleneck=8)
+features = torch.randn(4, 197, 768)
+print("output shape:", adapter(features).shape)
+print("adapter params:", sum(p.numel() for p in adapter.parameters()))
+```
+
+视觉中的 PEFT 还有提示微调（prompt tuning）和视觉提示（visual prompt tuning）：前者在文本侧学习软提示，后者在 patch 序列前拼接可学习 token。它们参数更少，但对初始化敏感，且不同任务之间往往不能共享。
+
+| 方法 | 可训练参数 | 推理开销 | 适合场景 |
+|---|---|---|---|
+| 线性探测 | 分类头 | 无 | 数据极少，快速基线 |
+| 全量微调 | 100% | 无 | 数据充足，追求最高指标 |
+| LoRA | 约 0.1%–2% | 合并后无 | 多任务、多租户、显存受限 |
+| Adapter | 约 0.5%–5% | 有串行开销 | 层级适配、研究对比 |
+| Prompt tuning | <0.1% | 无 | 大模型、任务提示可学习 |
+
+“可训练参数少”不等于“训练显存少”。激活值和输入仍然要占显存；真正省下的是优化器状态和梯度。对 ViT-B/16 这类 8600 万参数的模型，AdamW 的全量微调仅优化器状态就约 1.4 GB（按 fp32 的梯度、一阶矩、二阶矩共 12 字节/参数估算），而 LoRA 只占其中很小一部分。
+
+## 12.8 少样本与开放词汇
+
+少样本分类（few-shot classification）通常给每个新类 1–16 个标注样本，要求模型快速适配。标准协议包含 support set 和 query set，二者必须来自不同图像；把 support 样本也放进 query 是最常见的数据泄漏。
+
+开放词汇分类（open-vocabulary classification）把类别集合从固定标签扩展到任意文本描述，CLIP 是典型代表。落地时要注意：
+
+- 类别名有歧义时，用提示模板和同义词集成降低方差。
+- 新类与基类混合时，需要校准 logits，否则文本编码器的尺度偏差会偏向某些类别。
+- 闭集指标与开集指标不能混报；开放词汇场景还应报告未知类拒识率。
+
+## 12.9 工程坑
+
+::: {.callout-warning}
+## 迁移学习中最常见的失败
+
+- **预处理不一致**：预训练用的是 RGB、特定均值方差和双线性插值；推理管线却用了 BGR 或最近邻，指标会无声下降。
+- **冻结了参数却没冻结 BN**：running statistics 被目标域小批量覆盖，越训越差。
+- **在验证集上选提示词**：零样本评估变成了少样本调参，报告的数字不再是 zero-shot。
+- **只保存适配器却换了底座**：加载时形状能对上，语义已经错位。
+- **学习率照搬全量微调**：骨干被大步长破坏，表现为训练损失先降后升。
+- **忽略类别不均衡**：少样本 support set 每类数量不同，准确率会被多数类主导，应同时报告宏平均。
+:::
+
+## 12.10 小结
+
+- 预训练模型有三种用法：冻结特征、全量微调、PEFT；选择取决于数据量、域间距和部署约束。
+- 线性探测是评估特征质量的低成本协议，不是最终方案。
+- 极小数据下结果方差很大，必须多种子报告；单次实验的高低没有意义。
+- LoRA 用低秩增量修改线性层，初始化时等价于原模型，合并后没有推理开销。
+- CLIP 的零样本能力依赖提示词与类别集合，报告时必须交代完整评估协议。
 
 ## 练习
 
-1. 复现本章的基线结果，记录配置、随机种子、硬件与耗时。
-2. 修改一个关键设计或超参数，解释指标变化。
-3. 找一个失败案例，提出至少两条原因假设，并设计验证实验。
+1. 在 12.4 的实验中把目标样本从每类 5 张增加到 50 张，重新比较三种策略，解释差距如何变化。
+2. 给 ResNet-18 的每个残差 stage 设置不同的学习率，训练 CIFAR-10 子集，比较逐层衰减与统一学习率。
+3. 把 LoRA 应用到 TinyCNN 的两个卷积层，报告可训练参数比例与测试准确率。
+4. 用不同的提示模板评估 CLIP 在 10 类子集上的零样本准确率，分析方差来源。
+5. 设计一个实验，验证“冻结骨干 + no_grad”与“冻结骨干但保留梯度”在显存占用上的差异。
 
 ## 延伸阅读
 
-- 章节参考文献将在正文写作时补入 [参考文献](../appendix/references/index.qmd)。
+- He et al., *Deep Residual Learning for Image Recognition*, 2016. [@he2016resnet]
+- Radford et al., *Learning Transferable Visual Models From Natural Language Supervision*, 2021. [@radford2021clip]
+- Hu et al., *LoRA: Low-Rank Adaptation of Large Language Models*, 2022. [@hu2021lora]
+- Houlsby et al., *Parameter-Efficient Transfer Learning for NLP*, 2019. [@houlsby2019adapter]
+- Dosovitskiy et al., *An Image is Worth 16x16 Words*, 2021. [@dosovitskiy2021vit]
