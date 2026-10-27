@@ -1,84 +1,107 @@
 # 动手学计算机视觉（D2CV）
 
-> Dive into Computer Vision. 面向算法工程师的 PyTorch 计算机视觉教材。
-
-[![CI](https://github.com/yuanchongbit/d2cv/actions/workflows/ci.yml/badge.svg)](https://github.com/yuanchongbit/d2cv/actions/workflows/ci.yml)
-[![Deploy](https://github.com/yuanchongbit/d2cv/actions/workflows/publish.yml/badge.svg)](https://github.com/yuanchongbit/d2cv/actions/workflows/publish.yml)
-[![License: CC BY-SA 4.0](https://img.shields.io/badge/Text-CC%20BY--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-sa/4.0/)
-[![Code: MIT-0](https://img.shields.io/badge/Code-MIT--0-blue.svg)](LICENSE-CODE)
+> 面向算法工程师的 PyTorch 计算机视觉教材：从像素到部署，把每个概念跑起来。
 
 **在线阅读**：https://yuanchongbit.github.io/d2cv/
 
-## 这本书是什么
+[![License: CC BY-SA 4.0](https://img.shields.io/badge/Text-CC%20BY--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-sa/4.0/)
+[![Code: MIT-0](https://img.shields.io/badge/Code-MIT--0-blue.svg)](LICENSE-CODE)
 
-一本面向**有深度学习基础的算法工程师**的开源计算机视觉教材。用 PyTorch 一条技术栈，从图像与卷积讲到检测、分割、3D、生成、多模态与部署。
+## 这本书讲什么
+
+一本面向**有深度学习基础的算法工程师**的开源计算机视觉教材。它不重复深度学习通识，而是沿着一条完整的视觉链路展开：
+
+```text
+图像表示 → 卷积与特征 → 分类与骨干 → 检测 / 分割 / 姿态 / 跟踪
+        → 3D / 生成 / 多模态 → 数据 / 部署 / 鲁棒性
+        → 两个端到端项目 → 研究方法
+```
 
 每章遵循同一套结构：
 
 > 真实问题 → 原理与公式 → 从零实现 → 调库实现 → 实验与误差分析 → 工程坑 → 练习
 
-与 [D2L](https://zh-v2.d2l.ai/) 的关系：本书深受 D2L 启发，参考了其“可运行代码 + 从零实现”的教学法。作者本人正是通过 D2L 入门深度学习，并长期受益于其清晰的讲解与开源精神，在此向 D2L 作者团队和社区致以诚挚的感谢。本书是独立作品，与 D2L 团队无隶属关系；内容上不重复深度学习基础，聚焦 CV 的完整链路和工程落地。
+**适合谁**：有 1–3 年深度学习经验、想系统补齐 CV 知识、做出可展示项目并真正部署上线的工程师；也适合准备复现论文、搭建视觉系统的读者。
+
+**技术栈**：PyTorch + torchvision。核心算子先手写，再对照成熟实现；大部分实验可在 CPU 上完成，需要额外权重、GPU 或外部数据的示例会在正文中标注运行条件。
+
+## 全书内容
+
+| 部分 | 章节 | 内容 |
+|---|---|---|
+| 一、起步 | 第 1–2 章 | 视觉任务地图、实验环境与可复现工作流 |
+| 二、图像与卷积基础 | 第 3–5 章 | 图像表示与几何变换、卷积与滤波、经典特征与几何视觉 |
+| 三、分类与骨干网络 | 第 6–12 章 | 线性模型到 CNN、现代训练、轻量网络、ViT、自监督、迁移与 PEFT |
+| 四、识别、定位与分割 | 第 13–18 章 | 检测基础与检测器家族、语义/实例分割、姿态估计、视频与多目标跟踪 |
+| 五、3D、生成与多模态 | 第 19–21 章 | 深度与点云、光流与场景流、NeRF/3DGS、生成模型、视觉-语言模型 |
+| 六、工程落地与研究进阶 | 第 22–27 章 | 数据工程、模型压缩与部署、鲁棒性与安全、两个综合项目、论文复现与发表 |
+| 附录 A–F | — | 数学速查、环境依赖、数据集与指标、术语中英对照、参考文献、调试手册 |
+
+<details>
+<summary><strong>27 章速览</strong></summary>
+
+1. 导论：计算机视觉的任务地图
+2. 实验环境与可复现工作流
+3. 图像表示、颜色与几何变换
+4. 卷积、滤波与边缘检测
+5. 经典特征与几何视觉
+6. 从线性分类器到多层感知机
+7. 卷积神经网络：从 LeNet 到 ResNet
+8. 训练一个现代视觉模型
+9. 轻量网络与效率
+10. Vision Transformer 与混合架构
+11. 自监督与视觉基础模型
+12. 迁移学习与参数高效微调
+13. 目标检测基础
+14. 检测器家族：两阶段、单阶段与 DETR
+15. 语义分割
+16. 实例分割与提示分割
+17. 关键点与姿态估计（选读）
+18. 视频理解与多目标跟踪
+19. 深度估计、点云与 3D 视觉基础
+20. 生成模型
+21. 视觉-语言模型
+22. 数据工程与标注
+23. 模型压缩与推理部署
+24. 可解释性、鲁棒性与安全（选读）
+25. 综合项目一：自动驾驶感知
+26. 综合项目二：3D 视觉
+27. 从复现到发表（选读）
+
+</details>
+
+## 你会得到什么
+
+- **能跑的最小实现**：卷积、IoU/NMS/AP、分割损失、跟踪关联、BEV IoU、3D 框编码与解码等核心算子，都给出从零版本和库版本。
+- **两条完整感知链路**：第 25 章从相机图像到 2D 检测、跟踪、深度、车体坐标；第 26 章从激光雷达到 BEV 检测、速度估计与车端部署。
+- **工程视角**：数据泄漏、长尾分布、量化与导出、p99 延迟、时间同步、失败案例归类，而不是只报一个模型指标。
+- **研究视角**：论文三遍法、复现分级、因子消融、配对种子、置信区间与显著性检验，以及 benchmark 的常见陷阱。
+- **可当手册用的附录**：数学、环境、数据集与指标、术语、文献和调试清单。
 
 ## 当前状态
 
-**v1.0 初稿**：27 章正文与 6 个附录已全部写完，站点可构建、可部署。
+**v1.0 初稿**：27 章正文与 6 个附录已完成，正在进行全书技术审校与示例复跑。在线阅读站点会持续更新。
 
-- [x] 项目大纲与章节规划（27 章 + 6 个附录）
-- [x] Quarto 书站与 GitHub Pages 部署
-- [x] `d2cv` 工具包、测试与 CI
-- [x] 第 1–24 章正文（分类、检测、分割、3D、生成、多模态、部署、鲁棒性）
-- [x] 第 25–27 章正文（自动驾驶感知、3D 视觉、从复现到发表）
-- [x] 附录 A–F（数学、环境、数据集与指标、术语、文献、调试）
-- [ ] 全书技术审校与 v1.0 正式发布
+书中可执行代码单元的输出由实际运行生成；依赖较重或需要外部数据的单元会明确标注，正文说明运行条件。
 
-每章包含可运行代码、实验输出、工程坑、练习与延伸阅读。依赖较重或需要外部数据的单元标记为 `#| eval: false`，正文会说明运行条件。
+## 反馈与参与
 
-完整的章节规划、受众、设计原则与里程碑见 [OUTLINE.md](OUTLINE.md)。
+**欢迎提 Issue。** 内容包括但不限于：
 
-## 快速开始
+- 内容错误、公式笔误、术语或表述不一致；
+- 代码跑不通、输出与正文不符、依赖版本失效；
+- 某一章太难或太浅、希望补充的主题；
+- 数据集、评测指标、部署与工程实践中的问题。
 
-### 环境
+[提交新 Issue](https://github.com/yuanchongbit/d2cv/issues/new) · [查看已有 Issue](https://github.com/yuanchongbit/d2cv/issues)
 
-需要 Python 3.11+、[uv](https://docs.astral.sh/uv/)、[Quarto](https://quarto.org/)。
+提代码问题时，请附上章节号、代码块 label、Python/PyTorch 版本和完整报错，能显著加快定位。大改动（新增章节、调整全书结构）建议先开 Issue 讨论；提交 PR 前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-```bash
-uv sync --extra dev --extra book
-source .venv/bin/activate
-```
+完整的章节规划、受众与设计原则见 [OUTLINE.md](OUTLINE.md)。
 
-安装 PyTorch 时如需指定 CPU/CUDA 版本，请先按 [PyTorch 官方说明](https://pytorch.org/get-started/locally/) 安装，再执行 `uv sync --extra dev`。
+## 致谢
 
-### 构建书站
-
-```bash
-QUARTO_PYTHON="$PWD/.venv/bin/python" quarto preview book
-QUARTO_PYTHON="$PWD/.venv/bin/python" quarto render book
-```
-
-输出在 `book/_site/`。`QUARTO_PYTHON` 用于确保 Quarto 使用项目虚拟环境，而不是系统 Python。
-
-### 运行测试
-
-```bash
-pytest
-ruff check src tests
-```
-
-## 仓库结构
-
-```text
-book/            书稿（Quarto），每章一个目录
-src/d2cv/        跨章复用的工具包
-tests/           工具包单测
-scripts/         重型训练、评测、导出脚本
-experiments/     实验配置与结果规范
-.github/         CI 与 GitHub Pages 部署
-OUTLINE.md       全书大纲与写作计划
-```
-
-## 贡献
-
-欢迎提 Issue 和 PR。开始之前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)、[STYLE_GUIDE.md](STYLE_GUIDE.md) 和 [TERMINOLOGY.md](TERMINOLOGY.md)。
+与 [D2L](https://zh-v2.d2l.ai/) 的关系：本书深受 D2L 启发，参考了其“可运行代码 + 从零实现”的教学法。作者本人正是通过 D2L 入门深度学习，并长期受益于其清晰的讲解与开源精神，在此向 D2L 作者团队和社区致以诚挚的感谢。本书是独立作品，与 D2L 团队无隶属关系；内容上不重复深度学习基础，聚焦 CV 的完整链路和工程落地。
 
 ## 许可
 
