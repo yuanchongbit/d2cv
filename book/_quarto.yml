@@ -79,8 +79,8 @@ format:
     toc: true
     toc-depth: 3
     number-sections: false
-    code-fold: true
-    code-tools: true
+    code-fold: false
+    code-tools: false
     code-copy: true
     highlight-style: github
     lang: zh
